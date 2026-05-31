@@ -69,6 +69,39 @@ At a destination core, the router presents a local input tile with only the info
 
 The destination core consumes this local input tile by using the group index as the stage-1 input indirection address.
 
+## Back-pressure and natural step ordering
+
+The core should not need explicit timestep tags. Step ordering can be a natural consequence of local credits and ACKs: a predecessor is allowed to send the next tile on a mapped edge only after the successor has finished using the previous tile on that edge.
+
+The key question is: **when is it safe to let an output tile leave the core?** It is safe only when these conditions hold:
+
+1. **All required inputs for the output group have arrived.** The output group's `remaining_input_count` has reached zero.
+2. **All destination edges have credit.** Each successor/destination has previously ACKed the prior tile on that edge, so the current tile will not overrun a successor that is still waiting for other inputs.
+3. **The output tile has a place to go.** The output network queue/router can accept the generated network tile for all of its destinations.
+
+Only after these conditions are true may the core emit the output tile and open the next natural step for its predecessor edges.
+
+The successor ACK is therefore a **precondition for injection**, represented as credit on each outgoing destination edge. The core should not wait for a successor to process the just-sent tile before letting the tile leave; that would turn local flow control into a long end-to-end barrier. Instead, the successor processes the tile later and returns credit for the next tile on that same edge.
+
+The proposed ACK/NACK pressure can be stated as follows:
+
+1. **Compile-time mapping records predecessors.** For each output group, the mapping stage records `input_count`. It must also be possible to enumerate the predecessor edges represented by that count: source core/group, destination core/group, and destination output group.
+2. **Accepting an input tile closes that predecessor edge.** When a destination core accepts a local input tile for group `g`, that predecessor edge becomes busy and cannot accept the next tile from the same predecessor yet.
+3. **Consumption decrements output readiness counters.** The accepted tile is applied to every input/output pair selected by the input LUT, and each affected output group's `remaining_input_count` decrements.
+4. **The output group becomes complete at zero.** When `remaining_input_count == 0`, the output group has all inputs for the current natural step. It may compute its spike bitmap, but it should not inject the output tile until all outgoing destination credits are available.
+5. **Output injection consumes successor credit.** When the generated network tile is accepted by the output queue/router, the core consumes one credit on every outgoing destination edge carried by that tile.
+6. **Output acceptance releases predecessor credit.** Once the generated network tile is accepted by the output queue/router, the output group resets `remaining_input_count = input_count` and sends ACK/credit-return messages to all predecessor edges that contributed to that output group.
+7. **Early next tiles are stalled or rejected.** If a predecessor tries to send again before its ACK/credit return, the destination returns `NACK/BUSY` or the router/source stalls because the edge has no credit.
+
+This makes the protocol equivalent to one in-flight tile per mapped predecessor edge. Natural succession comes from credit return order rather than explicit timestep fields. If the network can reorder traffic, the implementation should preserve per-edge ordering for data and ACK messages, or keep the one-credit rule strict enough that there is never more than one unacknowledged tile per edge.
+
+Important design gaps to resolve in the next implementation stage:
+
+- Whether back-pressure is **credit-based** (preferred for hardware) or explicit `NACK` retry.
+- Whether ACKs are sent per input/output pair, per input group after all local output consumers finish, or aggregated by routers for multicast fanout.
+- How output-network back-pressure is represented when an output group is complete but its network tile cannot yet be accepted.
+- How to avoid deadlock when recurrent/cyclic core graphs exist; at minimum, bounded queues and deterministic credit initialization are needed.
+
 ## Input-interface hardware mechanism
 
 For each received input tile:
