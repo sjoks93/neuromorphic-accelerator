@@ -128,8 +128,8 @@ static void print_compute_counters(const NmcCore *core)
     printf("compute schedule: events=%u encoder_cycles=%llu output_parallelism=%u input_parallelism=%u last_input_tile_compute_cycles=%llu total_compute_cycles=%llu\n",
            core->last_input_tile_event_count,
            (unsigned long long)core->last_input_tile_encoder_cycles,
-           core->output_parallelism,
-           core->input_parallelism,
+           NMC_OUTPUT_PARALLELISM,
+           NMC_INPUT_PARALLELISM,
            (unsigned long long)core->last_input_tile_compute_cycles,
            (unsigned long long)core->total_compute_cycles);
 }
@@ -430,10 +430,11 @@ int main(void)
         INPUT_WIDTH = 8,
         OUTPUT_X_WIDTH = 8,
         OUTPUT_Y_WIDTH = 8,
+        OUTPUT_X_ACCUMULATOR_OFFSET = 0,
+        OUTPUT_Y_ACCUMULATOR_OFFSET = OUTPUT_X_ACCUMULATOR_OFFSET + OUTPUT_X_WIDTH,
         OUTPUT_X_INPUT_A_OFFSET = 0,
         OUTPUT_X_INPUT_B_OFFSET = OUTPUT_X_INPUT_A_OFFSET + OUTPUT_X_WIDTH * INPUT_WIDTH,
         OUTPUT_Y_INPUT_A_OFFSET = OUTPUT_X_INPUT_B_OFFSET + OUTPUT_X_WIDTH * INPUT_WIDTH,
-        WEIGHT_COUNT = OUTPUT_Y_INPUT_A_OFFSET + OUTPUT_Y_WIDTH * INPUT_WIDTH,
     };
 
     /*
@@ -444,16 +445,10 @@ int main(void)
      *
      * All weights are one, so each output neuron sees the input popcount.
      */
-    int16_t weights[WEIGHT_COUNT];
-    for (size_t i = 0; i < WEIGHT_COUNT; ++i) {
-        weights[i] = 1;
-    }
-
     /* Create one core under test. */
     NmcCore core;
-    nmc_core_init(&core, CORE_ID, weights, sizeof(weights) / sizeof(weights[0]));
-    CHECK(nmc_core_set_output_parallelism(&core, 2u));
-    CHECK(nmc_core_set_input_parallelism(&core, 2u));
+    nmc_core_init(&core, CORE_ID);
+    fill_weights(core.weights, NMC_WEIGHT_MEMORY_SIZE);
 
     /* Two input groups: A contributes to X and Y; B contributes only to X. */
     CHECK(nmc_core_add_input_group(&core));
@@ -469,6 +464,8 @@ int main(void)
     const int32_t thresholds_y[] = {1, 1, 1, 1, 1, 1, 1, 1};
     CHECK(nmc_core_add_output_group(&core, OUTPUT_X_WIDTH, thresholds_x));
     CHECK(nmc_core_add_output_group(&core, OUTPUT_Y_WIDTH, thresholds_y));
+    CHECK(nmc_core_set_output_accumulator_lut_start(&core, OUTPUT_X, OUTPUT_X_ACCUMULATOR_OFFSET));
+    CHECK(nmc_core_set_output_accumulator_lut_start(&core, OUTPUT_Y, OUTPUT_Y_ACCUMULATOR_OFFSET));
 
     /*
      * Stage-2 output route LUT, ordered as:
@@ -530,8 +527,8 @@ int main(void)
     print_input_tile(&step0_a);
     CHECK(nmc_core_process_input_tile(&core, &step0_a));
     CHECK(core.last_input_tile_event_count == 3u);
-    CHECK(core.last_input_tile_encoder_cycles == 3u);
-    CHECK(core.last_input_tile_compute_cycles == 16u);
+    CHECK(core.last_input_tile_encoder_cycles == 2u);
+    CHECK(core.last_input_tile_compute_cycles == 4u);
     print_compute_counters(&core);
     CHECK(drain_outputs(&core) == 1u);
     CHECK(drain_acks(&core) == 1u);
@@ -541,8 +538,8 @@ int main(void)
     print_input_tile(&step0_b);
     CHECK(nmc_core_process_input_tile(&core, &step0_b));
     CHECK(core.last_input_tile_event_count == 3u);
-    CHECK(core.last_input_tile_encoder_cycles == 2u);
-    CHECK(core.last_input_tile_compute_cycles == 8u);
+    CHECK(core.last_input_tile_encoder_cycles == 1u);
+    CHECK(core.last_input_tile_compute_cycles == 2u);
     print_compute_counters(&core);
     CHECK(drain_outputs(&core) == 1u);
     CHECK(drain_acks(&core) == 1u);
@@ -552,8 +549,8 @@ int main(void)
     print_input_tile(&step1_a);
     CHECK(nmc_core_process_input_tile(&core, &step1_a));
     CHECK(core.last_input_tile_event_count == 2u);
-    CHECK(core.last_input_tile_encoder_cycles == 3u);
-    CHECK(core.last_input_tile_compute_cycles == 16u);
+    CHECK(core.last_input_tile_encoder_cycles == 2u);
+    CHECK(core.last_input_tile_compute_cycles == 8u);
     print_compute_counters(&core);
     CHECK(drain_outputs(&core) == 0u);
     CHECK(drain_acks(&core) == 0u);
@@ -564,7 +561,7 @@ int main(void)
     CHECK(nmc_core_process_input_tile(&core, &step1_b));
     CHECK(core.last_input_tile_event_count == 2u);
     CHECK(core.last_input_tile_encoder_cycles == 2u);
-    CHECK(core.last_input_tile_compute_cycles == 8u);
+    CHECK(core.last_input_tile_compute_cycles == 4u);
     print_compute_counters(&core);
     CHECK(drain_outputs(&core) == 0u);
     CHECK(drain_acks(&core) == 0u);
@@ -593,7 +590,7 @@ int main(void)
     CHECK(nmc_core_process_input_tile(&core, &step2_b));
     CHECK(core.last_input_tile_event_count == 2u);
     CHECK(core.last_input_tile_encoder_cycles == 2u);
-    CHECK(core.last_input_tile_compute_cycles == 4u);
+    CHECK(core.last_input_tile_compute_cycles == 2u);
     print_compute_counters(&core);
     CHECK(drain_outputs(&core) == 0u);
     CHECK(drain_acks(&core) == 0u);
@@ -604,7 +601,7 @@ int main(void)
     CHECK(nmc_core_process_input_tile(&core, &step2_a));
     CHECK(core.last_input_tile_event_count == 1u);
     CHECK(core.last_input_tile_encoder_cycles == 2u);
-    CHECK(core.last_input_tile_compute_cycles == 8u);
+    CHECK(core.last_input_tile_compute_cycles == 4u);
     print_compute_counters(&core);
     CHECK(drain_outputs(&core) == 0u);
     CHECK(drain_acks(&core) == 0u);
@@ -631,17 +628,14 @@ int main(void)
         ENCODER_OUTPUT = 0,
         ENCODER_INPUT_WIDTH = 32,
         ENCODER_OUTPUT_WIDTH = 8,
-        ENCODER_WEIGHT_COUNT = ENCODER_INPUT_WIDTH * ENCODER_OUTPUT_WIDTH,
     };
-    int16_t encoder_weights[ENCODER_WEIGHT_COUNT];
-    fill_weights(encoder_weights, sizeof(encoder_weights) / sizeof(encoder_weights[0]));
     const int32_t encoder_thresholds[] = {1, 1, 1, 1, 1, 1, 1, 1};
     NmcCore encoder_core;
-    nmc_core_init(&encoder_core, ENCODER_CORE_ID, encoder_weights, sizeof(encoder_weights) / sizeof(encoder_weights[0]));
-    CHECK(nmc_core_set_output_parallelism(&encoder_core, 4u));
-    CHECK(nmc_core_set_input_parallelism(&encoder_core, 4u));
+    nmc_core_init(&encoder_core, ENCODER_CORE_ID);
+    fill_weights(encoder_core.weights, NMC_WEIGHT_MEMORY_SIZE);
     CHECK(nmc_core_add_input_group(&encoder_core));
     CHECK(nmc_core_add_output_group(&encoder_core, ENCODER_OUTPUT_WIDTH, encoder_thresholds));
+    CHECK(nmc_core_set_output_accumulator_lut_start(&encoder_core, ENCODER_OUTPUT, 0));
     CHECK(nmc_core_add_output_successor_lut_entry(&encoder_core, ENCODER_CORE_ID, ENCODER_INPUT));
     CHECK(nmc_core_set_output_lut_starts(&encoder_core, ENCODER_OUTPUT, 0, 1));
     CHECK(nmc_core_set_output_lut_starts(&encoder_core, 1, 1, 1));
@@ -713,7 +707,6 @@ int main(void)
         MULTI_ACK_FROM_CONSUMER = 0,
         MULTI_OUTPUT = 0,
         MULTI_WIDTH = 8,
-        MULTI_WEIGHT_COUNT = MULTI_WIDTH * MULTI_WIDTH,
     };
 
     const NmcCoreMeshMapEntry mesh_map[] = {
@@ -732,22 +725,15 @@ int main(void)
     nmc_router_init(&router_01, NMC_INVALID_INDEX, (NmcMeshCoordinate){.x = 0, .y = 1}, NMC_ROUTER_XY);
     nmc_router_init(&router_11, MULTI_CONSUMER_CORE, (NmcMeshCoordinate){.x = 1, .y = 1}, NMC_ROUTER_XY);
 
-    int16_t source_weights[MULTI_WEIGHT_COUNT];
-    int16_t consumer_weights[MULTI_WEIGHT_COUNT];
-    int16_t observer_weights[MULTI_WEIGHT_COUNT];
-    fill_weights(source_weights, sizeof(source_weights) / sizeof(source_weights[0]));
-    fill_weights(consumer_weights, sizeof(consumer_weights) / sizeof(consumer_weights[0]));
-    fill_weights(observer_weights, sizeof(observer_weights) / sizeof(observer_weights[0]));
-
     const int32_t multi_thresholds[] = {1, 1, 1, 1, 1, 1, 1, 1};
 
     NmcCore source_core;
-    nmc_core_init(&source_core, MULTI_SOURCE_CORE, source_weights, sizeof(source_weights) / sizeof(source_weights[0]));
-    CHECK(nmc_core_set_output_parallelism(&source_core, 4u));
-    CHECK(nmc_core_set_input_parallelism(&source_core, 4u));
+    nmc_core_init(&source_core, MULTI_SOURCE_CORE);
+    fill_weights(source_core.weights, NMC_WEIGHT_MEMORY_SIZE);
     CHECK(nmc_core_add_input_group(&source_core));
     CHECK(nmc_core_add_ack_group(&source_core));
     CHECK(nmc_core_add_output_group(&source_core, MULTI_WIDTH, multi_thresholds));
+    CHECK(nmc_core_set_output_accumulator_lut_start(&source_core, MULTI_OUTPUT, 0));
     CHECK(nmc_core_add_output_successor_lut_entry(&source_core, MULTI_CONSUMER_CORE, MULTI_INPUT));
     CHECK(nmc_core_set_output_lut_starts(&source_core, MULTI_OUTPUT, 0, 1));
     CHECK(nmc_core_set_output_lut_starts(&source_core, 1, 1, 1));
@@ -759,11 +745,11 @@ int main(void)
     CHECK(nmc_core_set_input_lut_start(&source_core, 1, 1));
 
     NmcCore consumer_core;
-    nmc_core_init(&consumer_core, MULTI_CONSUMER_CORE, consumer_weights, sizeof(consumer_weights) / sizeof(consumer_weights[0]));
-    CHECK(nmc_core_set_output_parallelism(&consumer_core, 4u));
-    CHECK(nmc_core_set_input_parallelism(&consumer_core, 4u));
+    nmc_core_init(&consumer_core, MULTI_CONSUMER_CORE);
+    fill_weights(consumer_core.weights, NMC_WEIGHT_MEMORY_SIZE);
     CHECK(nmc_core_add_input_group(&consumer_core));
     CHECK(nmc_core_add_output_group(&consumer_core, MULTI_WIDTH, multi_thresholds));
+    CHECK(nmc_core_set_output_accumulator_lut_start(&consumer_core, MULTI_OUTPUT, 0));
     CHECK(nmc_core_add_output_successor_lut_entry(&consumer_core, MULTI_OBSERVER_CORE, MULTI_INPUT));
     CHECK(nmc_core_add_output_predecessor_lut_entry(&consumer_core, MULTI_SOURCE_CORE, MULTI_ACK_FROM_CONSUMER));
     CHECK(nmc_core_set_output_lut_starts(&consumer_core, MULTI_OUTPUT, 0, 1));
@@ -773,11 +759,11 @@ int main(void)
     CHECK(nmc_core_set_input_lut_start(&consumer_core, 1, 1));
 
     NmcCore observer_core;
-    nmc_core_init(&observer_core, MULTI_OBSERVER_CORE, observer_weights, sizeof(observer_weights) / sizeof(observer_weights[0]));
-    CHECK(nmc_core_set_output_parallelism(&observer_core, 4u));
-    CHECK(nmc_core_set_input_parallelism(&observer_core, 4u));
+    nmc_core_init(&observer_core, MULTI_OBSERVER_CORE);
+    fill_weights(observer_core.weights, NMC_WEIGHT_MEMORY_SIZE);
     CHECK(nmc_core_add_input_group(&observer_core));
     CHECK(nmc_core_add_output_group(&observer_core, MULTI_WIDTH, multi_thresholds));
+    CHECK(nmc_core_set_output_accumulator_lut_start(&observer_core, MULTI_OUTPUT, 0));
     CHECK(nmc_core_set_output_lut_starts(&observer_core, MULTI_OUTPUT, 0, 0));
     CHECK(nmc_core_set_output_lut_starts(&observer_core, 1, 0, 0));
     CHECK(nmc_core_add_input_output_pair_lut_entry(&observer_core, MULTI_OUTPUT, 0));

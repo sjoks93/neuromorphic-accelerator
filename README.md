@@ -47,10 +47,11 @@ The current C model captures the core interface and execution semantics, while s
 - Weights are signed 16-bit integers in contiguous row-major matrices:
   - row = output neuron index
   - column = input neuron index
-- Accumulators are signed 32-bit integers.
-- Output accumulator and threshold state are stored per output neuron.
-- The current compute scheduler reshapes each input bitmap into `input_parallelism` sub-tiles, converts each sub-tile to non-zero event indices with an on-the-fly encoder, and reduces up to one event per input lane through an adder tree each compute cycle.
-- The event scheduling strategy also has configurable output-channel parallelism. Each cycle broadcasts the same input-lane event set to multiple output-neuron lanes in the same output group.
+- Each core has fixed-size local weight SRAM with `NMC_WEIGHT_MEMORY_SIZE` signed 16-bit entries.
+- Accumulators are signed 32-bit integers in fixed-size local accumulator SRAM with `NMC_ACCUMULATOR_MEMORY_SIZE` entries.
+- Output neuron thresholds are stored per output group, while accumulator storage is looked up through a per-output-group accumulator LUT.
+- The current compute scheduler reshapes each input bitmap into `NMC_INPUT_PARALLELISM` sub-tiles, converts each sub-tile to non-zero event indices with an on-the-fly encoder, and reduces up to one event per input lane through an adder tree each compute cycle.
+- The event scheduling strategy also has fixed output-channel parallelism from `NMC_OUTPUT_PARALLELISM`. Each cycle broadcasts the same input-lane event set to multiple output-neuron lanes in the same output group.
 - The scheduler prioritizes accumulator reuse by holding a block of output-neuron accumulators while traversing all non-zero input event steps for that block.
 - Weight matrices remain contiguous and row-major. For each output row, the scheduler calculates the row base for input `0` and adds each lane's current event index: `weight_offset + output_index * input_width + event_index`.
 - Output activation thresholds accumulators into a spike bitmap.
@@ -71,18 +72,19 @@ For each activated output group:
   - `predecessor_start`
 3. The successor route range is `[successor_start, predecessor_start)`.
 4. The predecessor ACK route range is `[predecessor_start, successor_start(next_output))`; the final output group uses the terminal output-table entry as `next_output`.
-5. Each successor entry supplies:
+5. A separate accumulator LUT maps the output index to the starting address of that group's accumulator row in accumulator SRAM.
+6. Each successor entry supplies:
   - target core ID
   - target group index as interpreted by the target core
-6. Each predecessor entry supplies:
+7. Each predecessor entry supplies:
   - predecessor core ID
   - predecessor group index to receive an ACK message
-7. The core emits one network tile containing:
+8. The core emits one network tile containing:
   - header field: number of destinations
   - header field: tile size / width
   - header array: successor destination addresses, each `{core_id, group_index}`
   - payload: spike bitmap with `width` bits
-8. After output injection succeeds, the core immediately emits one multicast ACK message containing the predecessor route entries and resets the output group's counters. The predecessor destination group index is interpreted as an ACK index by the receiving core.
+9. After output injection succeeds, the core immediately emits one multicast ACK message containing the predecessor route entries and resets the output group's counters. The predecessor destination group index is interpreted as an ACK index by the receiving core.
 
 ## Communication and tile consumption
 
@@ -162,9 +164,10 @@ For each received input tile:
 6. Each second-stage entry supplies:
   - output index
   - starting address of the contiguous weight matrix for this input/output pair
-7. The compute model consumes the input spikes against the addressed weight matrix, using the received tile width as the input matrix dimension.
-8. The output group's input-tile counter increments.
-9. If the input-tile counter reaches the configured input requirement, the output group becomes activation-ready; it emits a network tile when its ACK counter indicates synchronization and output queue space is available.
+7. The output index also selects the accumulator LUT entry that points to the output group's accumulator SRAM slice.
+8. The compute model consumes the input spikes against the addressed weight matrix, using the received tile width as the input matrix dimension, and accumulates into the addressed accumulator slice.
+9. The output group's input-tile counter increments.
+10. If the input-tile counter reaches the configured input requirement, the output group becomes activation-ready; it emits a network tile when its ACK counter indicates synchronization and output queue space is available.
 
 For each received ACK message:
 
@@ -179,12 +182,12 @@ For each received ACK message:
 
 ## Compute scheduling model
 
-The compute model now includes the main core datapath scheduling pieces: accumulator reuse, input sparsity, input-lane adder-tree reduction, and output-neuron SIMD parallelism. It still abstracts away lower-level timing inside the SIMD lanes, adder tree, and memory banks, assuming the weight memory is partitioned well enough to serve `output_parallelism x input_parallelism` weights per cycle.
+The compute model now includes the main core datapath scheduling pieces: accumulator reuse, input sparsity, input-lane adder-tree reduction, and output-neuron SIMD parallelism. The compute parallelism and SRAM capacities are hardware hyperparameters in [include/neuromorphic_core.h](include/neuromorphic_core.h): `NMC_INPUT_PARALLELISM`, `NMC_OUTPUT_PARALLELISM`, `NMC_WEIGHT_MEMORY_SIZE`, and `NMC_ACCUMULATOR_MEMORY_SIZE`. The model still abstracts away lower-level timing inside the SIMD lanes, adder tree, and memory banks, assuming the weight memory is partitioned well enough to serve `NMC_OUTPUT_PARALLELISM x NMC_INPUT_PARALLELISM` weights per cycle.
 
 The core inserts a bank of on-the-fly bitmap-to-event encoders between the input buffer and the compute engine:
 
 1. The input tile still arrives as a bitmap.
-2. The input tile is reshaped from `1 x T` into `input_parallelism x (T / input_parallelism)` sub-tiles. The tile width must divide evenly across the input lanes.
+2. The input tile is reshaped from `1 x T` into `NMC_INPUT_PARALLELISM x (T / NMC_INPUT_PARALLELISM)` sub-tiles. The tile width must divide evenly across the input lanes.
 3. Each sub-tile goes to one tile-to-event encoder.
 4. Each encoder has a `P`-bit priority search window, with `P = 8` in the current model.
 5. Each encoder cycle emits at most one non-zero event index from the current `P`-bit window.
@@ -195,35 +198,37 @@ The core inserts a bank of on-the-fly bitmap-to-event encoders between the input
 For each input tile and each selected input/output pair, the compute engine uses this schedule:
 
 1. Select the output group from the input/output pair LUT.
-2. Select a block of up to `output_parallelism` output neurons from that output group.
-3. Hold those output accumulators locally.
-4. Traverse the per-input-lane event streams in lockstep.
-5. In one cycle, broadcast the current set of up to `input_parallelism` event indices to all active output lanes in the block.
-6. For each active output lane, all input lanes share the same row base, and each input lane adds its own current event offset.
-7. The `input_parallelism` weights for one output lane are reduced by the adder tree and added to that output accumulator.
-8. Write the accumulator block back.
-9. Repeat the same ordered event-index walk for the next output block.
+2. Select the output group's accumulator SRAM base from the accumulator LUT.
+3. Select a block of up to `NMC_OUTPUT_PARALLELISM` output neurons from that output group.
+4. Hold those output accumulators locally.
+5. Traverse the per-input-lane event streams in lockstep.
+6. In one cycle, broadcast the current set of up to `NMC_INPUT_PARALLELISM` event indices to all active output lanes in the block.
+7. For each active output lane, all input lanes share the same row base, and each input lane adds its own current event offset.
+8. The `NMC_INPUT_PARALLELISM` weights for one output lane are reduced by the adder tree and added to that output accumulator.
+9. Write the accumulator block back to accumulator SRAM.
+10. Repeat the same ordered event-index walk for the next output block.
 
 The loop order is therefore output-block-major, then input-event-step-minor, then output-lane/input-lane work inside the same cycle:
 
 ```text
-lane_events = encode_nonzero_input_indices_per_lane(bitmap, input_parallelism)
+lane_events = encode_nonzero_input_indices_per_lane(bitmap, NMC_INPUT_PARALLELISM)
 
-for output_base in range(0, output_width, output_parallelism):
-  active_output_lanes = min(output_parallelism, output_width - output_base)
+for output_base in range(0, output_width, NMC_OUTPUT_PARALLELISM):
+  active_output_lanes = min(NMC_OUTPUT_PARALLELISM, output_width - output_base)
   for event_step in range(max_event_count_across_input_lanes):
     for output_lane in active_output_lanes:
       output = output_base + output_lane
       row_base = weight_offset + output * input_width
+      accumulator_address = accumulator_base + output
       reduced_sum = 0
-      for input_lane in range(input_parallelism):
+      for input_lane in range(NMC_INPUT_PARALLELISM):
         if event_step < event_count[input_lane]:
           event_index = lane_events[input_lane][event_step]
           reduced_sum += weights[row_base + event_index]
-      accumulators[output] += reduced_sum
+      accumulators[accumulator_address] += reduced_sum
 ```
 
-This schedule reuses the selected output accumulator block across all non-zero input event steps before moving to the next output block. Weight matrices remain row-major; event indices are offsets into each contiguous row. The model assumes weight memory is partitioned into `output_parallelism x input_parallelism` banks, so all parallel outputs can share the same set of input event addresses, and all input lanes for one output can share the same row base. With `output_parallelism = 2` and `input_parallelism = 2`, a sparse `8 x 8` input/output pair with three active events costs `8` compute cycles if the reshaped input lanes have event counts `{2, 1}`: four output blocks times two input-event steps. If one such input tile maps to two output groups, the test bench expects `16` compute cycles for that tile. The encoder counters model one emitted spike per cycle inside each non-empty `P` window per lane, with all lanes running in parallel. A separate `32`-bit test uses `input_parallelism = 4` and one late event to verify that empty lane windows and late sparse events are handled independently.
+This schedule reuses the selected output accumulator block across all non-zero input event steps before moving to the next output block. Weight matrices remain row-major; event indices are offsets into each contiguous row. The model assumes weight memory is partitioned into `NMC_OUTPUT_PARALLELISM x NMC_INPUT_PARALLELISM` banks, so all parallel outputs can share the same set of input event addresses, and all input lanes for one output can share the same row base. With `NMC_OUTPUT_PARALLELISM = 4` and `NMC_INPUT_PARALLELISM = 4`, a sparse `8 x 8` input/output pair with three active events costs `2` compute cycles if the reshaped input lanes have event counts `{1, 1, 1, 0}`: two output blocks times one input-event step. If one such input tile maps to two output groups, the test bench expects `4` compute cycles for that tile. The encoder counters model one emitted spike per cycle inside each non-empty `P` window per lane, with all lanes running in parallel. A separate `32`-bit test uses `NMC_INPUT_PARALLELISM = 4` and one late event to verify that empty lane windows and late sparse events are handled independently.
 
 ## Repository layout
 
@@ -324,6 +329,6 @@ The multi-core test assumes external spike input enters from the west side throu
 
 1. Add detailed SIMD lane and adder-tree timing beneath the current abstract compute-cycle model.
 2. Add accumulator-bank allocation and reuse constraints.
-3. Add memory-bank layout constraints for `output_parallelism x input_parallelism` event-indexed row accesses.
+3. Add memory-bank layout constraints for `NMC_OUTPUT_PARALLELISM x NMC_INPUT_PARALLELISM` event-indexed row accesses.
 4. Turn the multi-core test harness into a reusable mesh fabric module.
 5. Add traces and tests for overlapping input windows.

@@ -25,6 +25,10 @@
 #define NMC_MAX_OUTPUT_QUEUE 64u
 #define NMC_MAX_ACK_QUEUE 64u
 #define NMC_EVENT_ENCODER_WINDOW 8u
+#define NMC_INPUT_PARALLELISM 4u
+#define NMC_OUTPUT_PARALLELISM 4u
+#define NMC_WEIGHT_MEMORY_SIZE 1024u
+#define NMC_ACCUMULATOR_MEMORY_SIZE 1024u
 #define NMC_INVALID_INDEX UINT32_MAX
 
 typedef uint32_t nmc_core_id_t;
@@ -59,9 +63,8 @@ typedef struct {
     size_t predecessor_start;
 } NmcOutputRouteAddress;
 
-/* Per-output-neuron state kept separate from group routing metadata. */
+/* Per-output-neuron threshold state kept separate from group routing metadata. */
 typedef struct {
-    int32_t accumulator;
     int32_t threshold;
 } NmcNeuron;
 
@@ -151,6 +154,8 @@ typedef struct {
     NmcOutputGroup output_groups[NMC_MAX_OUTPUT_LUT_STARTS];
     size_t output_group_count;
 
+    NmcIndirectAddress accumulator_lut[NMC_MAX_OUTPUT_LUT_STARTS];
+
     NmcInputOutputPairLutEntry input_output_pair_lut[NMC_MAX_INPUT_OUTPUT_PAIR_LUT_ENTRIES];
     size_t input_output_pair_lut_count;
 
@@ -160,10 +165,8 @@ typedef struct {
     NmcOutputRouteLutEntry output_route_lut[NMC_MAX_OUTPUT_ROUTE_LUT_ENTRIES];
     size_t output_route_lut_count;
 
-    int16_t *weights;
-    size_t weight_count;
-    nmc_tile_width_t output_parallelism;
-    nmc_tile_width_t input_parallelism;
+    int16_t weights[NMC_WEIGHT_MEMORY_SIZE];
+    int32_t accumulators[NMC_ACCUMULATOR_MEMORY_SIZE];
 
     NmcNetworkTile output_queue[NMC_MAX_OUTPUT_QUEUE];
     size_t output_queue_count;
@@ -180,12 +183,13 @@ typedef struct {
 } NmcCore;
 
 /* Configuration and runtime API. */
-void nmc_core_init(NmcCore *core, nmc_core_id_t core_id, int16_t *weights, size_t weight_count);
-bool nmc_core_set_output_parallelism(NmcCore *core, nmc_tile_width_t output_parallelism);
-bool nmc_core_set_input_parallelism(NmcCore *core, nmc_tile_width_t input_parallelism);
+void nmc_core_init(NmcCore *core, nmc_core_id_t core_id);
 bool nmc_core_add_input_group(NmcCore *core);
 bool nmc_core_add_ack_group(NmcCore *core);
 bool nmc_core_add_output_group(NmcCore *core, nmc_tile_width_t width, const int32_t *thresholds);
+bool nmc_core_set_output_accumulator_lut_start(NmcCore *core,
+                                               nmc_output_index_t output_index,
+                                               size_t accumulator_start);
 bool nmc_core_set_output_lut_starts(NmcCore *core,
                                     nmc_output_index_t output_index,
                                     size_t successor_start,

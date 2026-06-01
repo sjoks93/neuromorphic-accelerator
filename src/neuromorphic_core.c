@@ -20,6 +20,25 @@ static bool valid_output_index(const NmcCore *core, nmc_output_index_t output_in
     return output_index < core->output_group_count;
 }
 
+static bool output_accumulators_fit(const NmcCore *core, nmc_output_index_t output_index, size_t *accumulator_start)
+{
+    if (!valid_output_index(core, output_index)) {
+        return false;
+    }
+
+    const NmcIndirectAddress *entry = &core->accumulator_lut[output_index];
+    const size_t output_width = core->output_groups[output_index].route_lut.bitmap_width;
+    if (!entry->valid || entry->start > NMC_ACCUMULATOR_MEMORY_SIZE) {
+        return false;
+    }
+    if (output_width > NMC_ACCUMULATOR_MEMORY_SIZE - entry->start) {
+        return false;
+    }
+
+    *accumulator_start = entry->start;
+    return true;
+}
+
 /* Width is carried in tile headers and must map cleanly onto bytes. */
 static bool valid_width(nmc_tile_width_t width)
 {
@@ -57,37 +76,13 @@ static bool pair_weights_fit(const NmcCore *core, nmc_tile_width_t input_width, 
 
     const size_t output_width = core->output_groups[pair_entry->output_index].route_lut.bitmap_width;
     const size_t pair_weights = (size_t)input_width * output_width;
-    return pair_entry->weight_offset <= core->weight_count && pair_weights <= core->weight_count - pair_entry->weight_offset;
+    return pair_entry->weight_offset <= NMC_WEIGHT_MEMORY_SIZE && pair_weights <= NMC_WEIGHT_MEMORY_SIZE - pair_entry->weight_offset;
 }
 
-void nmc_core_init(NmcCore *core, nmc_core_id_t core_id, int16_t *weights, size_t weight_count)
+void nmc_core_init(NmcCore *core, nmc_core_id_t core_id)
 {
     memset(core, 0, sizeof(*core));
     core->core_id = core_id;
-    core->weights = weights;
-    core->weight_count = weight_count;
-    core->output_parallelism = 1u;
-    core->input_parallelism = 1u;
-}
-
-bool nmc_core_set_output_parallelism(NmcCore *core, nmc_tile_width_t output_parallelism)
-{
-    if (output_parallelism == 0u || output_parallelism > NMC_MAX_GROUP_NEURONS) {
-        return false;
-    }
-
-    core->output_parallelism = output_parallelism;
-    return true;
-}
-
-bool nmc_core_set_input_parallelism(NmcCore *core, nmc_tile_width_t input_parallelism)
-{
-    if (input_parallelism == 0u || input_parallelism > NMC_MAX_GROUP_NEURONS) {
-        return false;
-    }
-
-    core->input_parallelism = input_parallelism;
-    return true;
 }
 
 bool nmc_core_add_input_group(NmcCore *core)
@@ -122,6 +117,26 @@ bool nmc_core_add_output_group(NmcCore *core, nmc_tile_width_t width, const int3
     for (nmc_tile_width_t i = 0; i < width; ++i) {
         group->neurons[i].threshold = thresholds ? thresholds[i] : 1;
     }
+    return true;
+}
+
+bool nmc_core_set_output_accumulator_lut_start(NmcCore *core,
+                                               nmc_output_index_t output_index,
+                                               size_t accumulator_start)
+{
+    if (!valid_output_index(core, output_index) || accumulator_start >= NMC_ACCUMULATOR_MEMORY_SIZE) {
+        return false;
+    }
+
+    const size_t output_width = core->output_groups[output_index].route_lut.bitmap_width;
+    if (output_width > NMC_ACCUMULATOR_MEMORY_SIZE - accumulator_start) {
+        return false;
+    }
+
+    core->accumulator_lut[output_index] = (NmcIndirectAddress){
+        .valid = true,
+        .start = accumulator_start,
+    };
     return true;
 }
 
@@ -224,7 +239,7 @@ bool nmc_core_add_input_output_pair_lut_entry(NmcCore *core,
         return false;
     }
 
-    if (!valid_output_index(core, output_index) || weight_offset >= core->weight_count) {
+    if (!valid_output_index(core, output_index) || weight_offset >= NMC_WEIGHT_MEMORY_SIZE) {
         return false;
     }
 
@@ -325,22 +340,21 @@ static bool encode_input_lane_events(const uint8_t *input_payload,
     return true;
 }
 
-static bool encode_input_events(const NmcCore *core,
-                                const uint8_t *input_payload,
+static bool encode_input_events(const uint8_t *input_payload,
                                 nmc_tile_width_t input_width,
                                 NmcInputLaneEvents *lane_events,
                                 uint32_t *event_count,
                                 uint64_t *encoder_cycles)
 {
-    if (!valid_width(input_width) || core->input_parallelism == 0u || input_width < core->input_parallelism ||
-        (input_width % core->input_parallelism) != 0u) {
+    if (!valid_width(input_width) || input_width < NMC_INPUT_PARALLELISM ||
+        (input_width % NMC_INPUT_PARALLELISM) != 0u) {
         return false;
     }
 
     *event_count = 0u;
     *encoder_cycles = 0u;
-    const nmc_tile_width_t lane_width = (nmc_tile_width_t)(input_width / core->input_parallelism);
-    for (nmc_tile_width_t lane = 0u; lane < core->input_parallelism; ++lane) {
+    const nmc_tile_width_t lane_width = (nmc_tile_width_t)(input_width / NMC_INPUT_PARALLELISM);
+    for (nmc_tile_width_t lane = 0u; lane < NMC_INPUT_PARALLELISM; ++lane) {
         const nmc_tile_width_t lane_start = (nmc_tile_width_t)(lane * lane_width);
         if (!encode_input_lane_events(input_payload, input_width, lane_start, lane_width, &lane_events[lane])) {
             return false;
@@ -369,41 +383,46 @@ static bool encode_input_events(const NmcCore *core,
  * sub-tile.  Zero input columns no longer consume compute cycles, and up to M
  * non-zero input weights are reduced by the adder tree per output lane per cycle.
  */
-static void accumulate_pair(NmcCore *core,
+static bool accumulate_pair(NmcCore *core,
                             nmc_tile_width_t input_width,
                             const NmcInputOutputPairLutEntry *pair_entry,
                             NmcOutputGroup *output_group,
                             const NmcInputLaneEvents *lane_events)
 {
-    const size_t output_parallelism = core->output_parallelism;
-    const size_t input_parallelism = core->input_parallelism;
+    size_t accumulator_start = 0u;
+    if (!output_accumulators_fit(core, pair_entry->output_index, &accumulator_start)) {
+        return false;
+    }
+
     uint32_t input_steps = 0u;
-    for (size_t input_lane = 0u; input_lane < input_parallelism; ++input_lane) {
+    for (size_t input_lane = 0u; input_lane < NMC_INPUT_PARALLELISM; ++input_lane) {
         if (input_steps < lane_events[input_lane].event_count) {
             input_steps = lane_events[input_lane].event_count;
         }
     }
 
-    for (size_t out_base = 0; out_base < output_group->route_lut.bitmap_width; out_base += output_parallelism) {
+    for (size_t out_base = 0; out_base < output_group->route_lut.bitmap_width; out_base += NMC_OUTPUT_PARALLELISM) {
         const size_t remaining_outputs = output_group->route_lut.bitmap_width - out_base;
-        const size_t active_lanes = remaining_outputs < output_parallelism ? remaining_outputs : output_parallelism;
+        const size_t active_lanes = remaining_outputs < NMC_OUTPUT_PARALLELISM ? remaining_outputs : NMC_OUTPUT_PARALLELISM;
         for (uint32_t input_step = 0u; input_step < input_steps; ++input_step) {
             for (size_t lane = 0u; lane < active_lanes; ++lane) {
                 const size_t out = out_base + lane;
                 const size_t row_base = pair_entry->weight_offset + out * input_width;
                 int32_t reduced_sum = 0;
-                for (size_t input_lane = 0u; input_lane < input_parallelism; ++input_lane) {
+                for (size_t input_lane = 0u; input_lane < NMC_INPUT_PARALLELISM; ++input_lane) {
                     if (input_step < lane_events[input_lane].event_count) {
                         const size_t weight_index = row_base + lane_events[input_lane].events[input_step];
                         reduced_sum += core->weights[weight_index];
                     }
                 }
-                output_group->neurons[out].accumulator += reduced_sum;
+                core->accumulators[accumulator_start + out] += reduced_sum;
             }
             ++core->last_input_tile_compute_cycles;
             ++core->total_compute_cycles;
         }
     }
+
+    return true;
 }
 
 static bool output_group_ready(const NmcOutputGroup *group)
@@ -549,12 +568,18 @@ static bool activate_output_group(NmcCore *core, nmc_output_index_t output_index
     }
 
     /* Threshold accumulated neuron values into the outgoing spike bitmap. */
+    size_t accumulator_start = 0u;
+    if (!output_accumulators_fit(core, output_index, &accumulator_start)) {
+        return false;
+    }
+
     uint8_t payload[NMC_MAX_GROUP_BYTES] = {0};
     for (nmc_tile_width_t i = 0; i < group->route_lut.bitmap_width; ++i) {
-        if (group->neurons[i].accumulator >= group->neurons[i].threshold) {
+        int32_t *accumulator = &core->accumulators[accumulator_start + i];
+        if (*accumulator >= group->neurons[i].threshold) {
             payload_set_bit(payload, i);
         }
-        group->neurons[i].accumulator = 0;
+        *accumulator = 0;
     }
     if (!enqueue_network_tile(core, output_index, payload)) {
         return false;
@@ -599,7 +624,7 @@ bool nmc_core_process_input_tile(NmcCore *core, const NmcInputTile *tile)
     NmcInputLaneEvents lane_events[NMC_MAX_GROUP_NEURONS];
     uint32_t event_count = 0u;
     uint64_t encoder_cycles = 0u;
-    if (!encode_input_events(core, tile->payload, tile->width, lane_events, &event_count, &encoder_cycles)) {
+    if (!encode_input_events(tile->payload, tile->width, lane_events, &event_count, &encoder_cycles)) {
         return false;
     }
     core->last_input_tile_event_count = event_count;
@@ -630,7 +655,9 @@ bool nmc_core_process_input_tile(NmcCore *core, const NmcInputTile *tile)
         }
 
         /* One arrival contributes once to this output group's current step. */
-        accumulate_pair(core, tile->width, pair_entry, output_group, lane_events);
+        if (!accumulate_pair(core, tile->width, pair_entry, output_group, lane_events)) {
+            return false;
+        }
         ++output_group->input_count;
         matched = true;
 
