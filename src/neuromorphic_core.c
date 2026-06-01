@@ -326,16 +326,24 @@ static bool enqueue_predecessor_acks(NmcCore *core, nmc_output_index_t output_in
     if (!output_group_predecessor_end(core, output_index, &predecessor_end)) {
         return false;
     }
-    if (predecessor_count > NMC_MAX_ACK_QUEUE - core->ack_queue_count) {
+    if (predecessor_count > NMC_MAX_TILE_DESTINATIONS) {
+        return false;
+    }
+    if (predecessor_count == 0u) {
+        return true;
+    }
+    if (core->ack_queue_count >= NMC_MAX_ACK_QUEUE) {
         return false;
     }
 
-    /* ACKs release predecessor edges for their next natural step. */
+    /* One ACK message per completed output group, multicast to all predecessor edges. */
+    NmcAckMessage *ack = &core->ack_queue[core->ack_queue_count++];
+    memset(ack, 0, sizeof(*ack));
+    ack->destination_count = (uint8_t)predecessor_count;
+    ack->completed_output_index = output_index;
+
     for (size_t i = route_lut->predecessor_start; i < predecessor_end; ++i) {
-        core->ack_queue[core->ack_queue_count++] = (NmcAckMessage){
-            .destination = core->output_route_lut[i].address,
-            .completed_output_index = output_index,
-        };
+        ack->destinations[i - route_lut->predecessor_start] = core->output_route_lut[i].address;
     }
 
     return true;
@@ -374,7 +382,10 @@ static bool activate_output_group(NmcCore *core, nmc_output_index_t output_index
         return false;
     }
     const size_t predecessor_count = predecessor_end - group->route_lut.predecessor_start;
-    if (predecessor_count > NMC_MAX_ACK_QUEUE - core->ack_queue_count) {
+    if (predecessor_count > NMC_MAX_TILE_DESTINATIONS) {
+        return false;
+    }
+    if (predecessor_count != 0u && core->ack_queue_count >= NMC_MAX_ACK_QUEUE) {
         return false;
     }
 
@@ -472,8 +483,12 @@ bool nmc_core_pop_output_tile(NmcCore *core, NmcNetworkTile *tile)
 
 bool nmc_core_process_ack(NmcCore *core, const NmcAckMessage *ack)
 {
-    /* The router has selected this core; the local group field is the ACK index. */
-    const nmc_ack_index_t ack_index = (nmc_ack_index_t)ack->destination.group_index;
+    /* The router has selected this core; the local destination group field is the ACK index. */
+    if (ack->destination_count != 1u) {
+        return false;
+    }
+
+    const nmc_ack_index_t ack_index = (nmc_ack_index_t)ack->destinations[0].group_index;
     if (!valid_ack_index(core, ack_index)) {
         return false;
     }

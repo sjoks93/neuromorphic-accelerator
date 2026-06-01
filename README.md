@@ -4,6 +4,8 @@ This repository models the first design stage of a digital neuromorphic core spe
 
 The current implementation focuses on the **input interface**, **output interface**, and the scheduling/marking behavior around input and output neuron groups. The neuron compute path is intentionally simplified so the interface concepts can be evolved before adding detailed datapath timing, accumulator banking, SIMD lanes, or adder-tree behavior.
 
+The next implementation layer has also started: a standalone **2D mesh router** model can route tile or multicast ACK messages with XY or YX dimension-order routing and multicast splitting before the router is integrated with multiple cores.
+
 ## Core concepts
 
 - **Spike tiles are byte-array bitmaps**: an input or output tile carries one bit per neuron in a group, with group widths constrained to multiples of 8.
@@ -26,13 +28,13 @@ The current implementation focuses on the **input interface**, **output interfac
   - a terminal output-table entry after the last output group supplies the final predecessor exclusive end
   - stage 2: route entries are ordered as `successors(G0), predecessors(G0), successors(G1), predecessors(G1), ...`
   - successor entries route output network tiles forward
-  - predecessor entries route ACK messages backward
+  - predecessor entries route multicast ACK messages backward
 - The input group table and ACK group table both store valid start addresses into their stage-2 pair LUTs, including one terminal start after the last real group; the output group table uses route addresses (`valid`, `bitmap_width`, `successor_start`, `predecessor_start`), including one terminal start entry after the last output group.
 - For every input-group / output-group pair, weights are stored contiguously in memory and referenced by the LUT.
 - When an input tile is received, every matching input/output pair is consumed once for the current step.
 - Each output group stores a compile-time input requirement plus two runtime counters: received input tiles and received successor ACKs.
 - When all subscribed inputs of an output group are consumed and successor ACK synchronization is complete, the group is activated and both runtime counters reset to zero after output injection.
-- Each activated output group emits one network tile with a destination-address header and bitmap payload.
+- Each activated output group emits one network tile with a destination-address header and bitmap payload, plus one ACK message with a destination-address header and no payload for that output group's predecessors.
 
 ## Stage 1 simplifications
 
@@ -52,7 +54,7 @@ The current C model captures the core interface and execution semantics, while s
 - Accumulators are reset after activation, modeling accumulator reuse.
 - The mapping stage records each output group's subscribed input requirement in the output group table. Runtime consumption increments the output group's input-tile counter instead of using consumed masks.
 - Each output group carries two runtime counters: an input-tile counter for activation readiness and an ACK counter for successor synchronization.
-- Output injection immediately produces routed predecessor ACK messages, while successor ACK synchronization gates the next output injection.
+- Output injection immediately produces one routed multicast predecessor ACK message, while successor ACK synchronization gates the next output injection.
 - Incoming successor ACK messages are consumed through the ACK input LUT rather than by directly naming a route entry. This keeps ACK handling index-based, just like input tile consumption.
 
 ## Output-interface hardware mechanism
@@ -77,11 +79,19 @@ For each activated output group:
   - header field: tile size / width
   - header array: successor destination addresses, each `{core_id, group_index}`
   - payload: spike bitmap with `width` bits
-8. After output injection succeeds, the core immediately emits ACK messages to the predecessor route entries and resets the output group's counters. The predecessor destination group index is interpreted as an ACK index by the receiving core.
+8. After output injection succeeds, the core immediately emits one multicast ACK message containing the predecessor route entries and resets the output group's counters. The predecessor destination group index is interpreted as an ACK index by the receiving core.
 
 ## Communication and tile consumption
 
-The generated network tile is router-facing. Routers inspect the destination-address array and forward/copy the tile toward each target core.
+Generated network tiles and ACK messages are router-facing. Routers inspect the destination-address array and forward/copy each message toward each target core. A nonzero tile size/width indicates a spike tile with payload; width `0` represents an ACK message with no payload.
+
+The standalone router model uses mesh coordinates rather than core-local IDs.  For each destination it chooses one next-hop port:
+
+- `LOCAL` if the destination coordinate equals the router coordinate
+- `EAST` or `WEST` if the selected routing order resolves the x dimension next
+- `NORTH` or `SOUTH` if the selected routing order resolves the y dimension next
+
+For multicast, the router partitions the destination list by next-hop port and enqueues one updated message per non-empty port.  The same header structure is used for tiles and ACKs: destination count, tile size/width, then the destination-address array.  Tile messages carry a payload after the destination header; ACK messages use width `0` and carry no payload. A destination whose next hop is `LOCAL` can be decoded into a core-facing input tile or ACK message using the router's attached local core ID.  This makes the router a pure communication component for now; a later multi-core wrapper can connect each directional queue to a neighboring router and connect the local queue to an `NmcCore`.
 
 At a destination core, the router presents a local input tile with only the information the destination needs:
 
@@ -113,19 +123,19 @@ The proposed ACK/NACK pressure can be stated as follows:
 2. **Accepting an input tile closes that predecessor edge.** When a destination core accepts a local input tile for group `g`, that predecessor edge becomes busy and cannot accept the next tile from the same predecessor yet.
 3. **Consumption increments output readiness counters.** The accepted tile is applied to every input/output pair selected by the input LUT, and each affected output group's input-tile counter increments.
 4. **The output group becomes complete when its input counter reaches its requirement.** It may compute its spike bitmap, but it should not inject the output tile until its ACK counter also reaches the successor count derived from the output route LUT.
-5. **Output injection consumes the inputs immediately.** When the generated network tile is accepted by the output queue/router, the core sends ACK messages to all predecessor edges that contributed to that output group.
+5. **Output injection consumes the inputs immediately.** When the generated network tile is accepted by the output queue/router, the core sends one multicast ACK message to all predecessor edges that contributed to that output group.
 6. **Output injection starts a new synchronization window.** The core resets that output group's input-tile counter and ACK counter to zero. New predecessor tiles may be consumed and counted immediately, but the next output remains blocked while the ACK counter is below the successor count.
 7. **Successor ACK completion releases the next output, not the next input.** As successor ACK messages arrive, the ACK input LUT increments the output group's ACK counter. If the next input set is already complete, reaching the successor count flushes the pending output and immediately ACKs its predecessors.
 
 This makes the protocol equivalent to one in-flight tile per mapped predecessor edge. Natural succession comes from ACK return order rather than explicit timestep fields. If the network can reorder traffic, the implementation should preserve per-edge ordering for data and ACK messages, or keep the one-in-flight rule strict enough that there is never more than one unacknowledged tile per edge.
 
-The current C model starts this mechanism by storing input and ACK counters on each output group. Successful output injection enqueues predecessor ACK messages immediately and resets both counters. A complete multi-core simulation should route these ACK messages back to predecessor cores. At the receiving predecessor, the ACK message's group index selects the ACK input LUT; that LUT can increment one or more output-group ACK counters and potentially flush a pending output.
+The current C model starts this mechanism by storing input and ACK counters on each output group. Successful output injection enqueues one multicast predecessor ACK message immediately and resets both counters. A complete multi-core simulation should route these ACK messages back to predecessor cores, splitting the destination header as needed. At each receiving predecessor, the local ACK message's group index selects the ACK input LUT; that LUT can increment one or more output-group ACK counters and potentially flush a pending output.
 
 Important design gaps to resolve in the next implementation stage:
 
 - How explicit `NACK/BUSY` retry should be represented if a source violates the ACK ordering rule.
 - Whether ACKs are sent per input/output pair, per input group after all local output consumers finish, or aggregated by routers for multicast fanout.
-- How output-network back-pressure is represented when an output group is complete but its network tile cannot yet be accepted.
+- How output-network back-pressure is represented when an output group is complete but its network tile or multicast ACK cannot yet be accepted.
 - How predecessor route entries are generated for remote cores during mapping.
 - How to avoid deadlock when recurrent/cyclic core graphs exist; at minimum, bounded queues and deterministic ACK-counter initialization are needed.
 
@@ -171,10 +181,12 @@ For each received ACK message:
 ├── Makefile
 ├── README.md
 ├── include/
-│   └── neuromorphic_core.h
+│   ├── neuromorphic_core.h
+│   └── neuromorphic_router.h
 └── src/
     ├── main.c
-    └── neuromorphic_core.c
+    ├── neuromorphic_core.c
+    └── neuromorphic_router.c
 ```
 
 ## Build and run
@@ -209,8 +221,8 @@ The demo instantiates one core with:
   - output index `1`, eight output neurons wide, subscribed only to input index `0`
 - Contiguous weight memory slices for each input/output pair.
 - Output route LUT entries ordered as successors then predecessors per output group:
-  - output index `0`: successors target cores `1` and `2`, then predecessor ACK indices `0` and `1` on the predecessor core
-  - output index `1`: successors target cores `1` and `3`, then predecessor ACK index `0` on the predecessor core
+  - output index `0`: successors target cores `1` and `2`, then one multicast ACK header with predecessor ACK indices `0` and `1` on the predecessor core
+  - output index `1`: successors target cores `1` and `3`, then one multicast ACK header with predecessor ACK index `0` on the predecessor core
   - terminal output entry: successor/predecessor starts are both `7`, terminating output index `1`'s predecessor range
 
 The executable is now a small self-checking test bench rather than a single-shot demo. It exercises:
@@ -220,12 +232,12 @@ The executable is now a small self-checking test bench rather than a single-shot
   - output index `1` emits immediately because it only depends on input index `0`
   - output index `0` waits for input index `1`
 3. Completion of that first step when input index `1` arrives and output index `0` emits.
-4. Each output emission immediately generates predecessor ACKs, so natural step `1` can arrive before successor ACKs for step `0` have returned.
+4. Each output emission immediately generates one multicast predecessor ACK message, so natural step `1` can arrive before successor ACKs for step `0` have returned.
 5. A second natural step whose inputs are consumed while both output groups are still successor-ACK blocked.
 6. Explicit successor ACK returns for the first step:
   - returning the common core-`1` successor ACK increments both output groups, but neither group is complete yet
-  - returning output index `1`'s core-`3` successor ACK flushes output index `1`'s pending step-`1` output and immediately ACKs its predecessor
-  - returning output index `0`'s core-`2` successor ACK flushes output index `0`'s pending step-`1` output and immediately ACKs its predecessors
+  - returning output index `1`'s core-`3` successor ACK flushes output index `1`'s pending step-`1` output and immediately sends one multicast ACK to its predecessor list
+  - returning output index `0`'s core-`2` successor ACK flushes output index `0`'s pending step-`1` output and immediately sends one multicast ACK to its predecessor list
 7. A third natural step with reversed input arrival order:
   - input index `1` arrives first and completes no output
   - input index `0` arrives second and completes both output groups, but both stay blocked until successor ACKs from step `1` return
@@ -233,11 +245,35 @@ The executable is now a small self-checking test bench rather than a single-shot
 
 The test bench fails with a nonzero exit code if any expected output tile count or ACK count is wrong.
 
+The same executable also includes a standalone router test bench. It verifies that:
+
+1. An XY router at coordinate `(1, 1)` splits a six-destination multicast message into local, east, west, north, and south output-port messages.
+2. The east output receives two destinations when two target coordinates need the same first XY hop.
+3. The local output can be decoded back into a core-facing input tile.
+4. A YX router sends the same off-axis destination vertically first, demonstrating that the routing-order configuration changes the first hop.
+
+Finally, the executable now includes a small multi-core mesh test bench. It uses three configured cores attached to a 2x2 router mesh:
+
+- source core `10` at coordinate `(0, 0)`
+- observer core `12` at coordinate `(1, 0)`
+- consumer core `11` at coordinate `(1, 1)`
+- one pass-through router at coordinate `(0, 1)`
+
+The multi-core test assumes external spike input enters from the west side through the edge router at `(0, 0)`. The test then checks that:
+
+1. The side-injected tile is routed to the source core's local input port.
+2. The source core emits a tile toward the consumer core.
+3. XY routing forwards that tile east from `(0, 0)` to `(1, 0)`, then south to `(1, 1)`.
+4. The consumer core receives the tile, emits an output tile to the observer core, and immediately emits a multicast predecessor ACK message back toward the source core.
+5. The observer tile routes north from `(1, 1)` to `(1, 0)` and is consumed by the observer core.
+6. The ACK routes west from `(1, 1)` to `(0, 1)`, then north to `(0, 0)`, where it is consumed by the source core's ACK LUT.
+7. After the ACK returns, a second west-side injected input can make the source core emit another output tile.
+
 ## Suggested next iterations
 
 1. Add explicit input-event parallelization with an adder-tree reduction model.
 2. Add SIMD output-neuron lanes and cycle-level scheduling.
 3. Add accumulator-bank allocation and reuse constraints.
 4. Add memory-bank layout constraints for contiguous weights.
-5. Add multi-core routing and tile delivery simulation.
+5. Turn the multi-core test harness into a reusable mesh fabric module.
 6. Add traces and tests for overlapping input windows.

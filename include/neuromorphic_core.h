@@ -115,9 +115,10 @@ typedef struct {
     NmcDestinationAddress address;
 } NmcOutputRouteLutEntry;
 
-/* Routed ACK message sent to predecessors after output injection. */
+/* Router-facing ACK message: no payload, but the destination header is multicast. */
 typedef struct {
-    NmcDestinationAddress destination;
+    uint8_t destination_count;
+    NmcDestinationAddress destinations[NMC_MAX_TILE_DESTINATIONS];
     nmc_output_index_t completed_output_index;
 } NmcAckMessage;
 
