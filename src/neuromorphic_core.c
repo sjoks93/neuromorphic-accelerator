@@ -33,15 +33,14 @@ static void payload_set_bit(uint8_t *payload, size_t bit_index)
     payload[bit_index / NMC_BITS_PER_BYTE] |= (uint8_t)(UINT8_C(1) << (bit_index % NMC_BITS_PER_BYTE));
 }
 
-static bool pair_weights_fit(const NmcCore *core, nmc_input_index_t input_index, const NmcInputOutputPairLutEntry *pair_entry)
+static bool pair_weights_fit(const NmcCore *core, nmc_tile_width_t input_width, const NmcInputOutputPairLutEntry *pair_entry)
 {
-    if (!valid_input_index(core, input_index) || !valid_output_index(core, pair_entry->output_index)) {
+    if (!valid_width(input_width) || !valid_output_index(core, pair_entry->output_index)) {
         return false;
     }
 
-    const size_t input_width = core->input_groups[input_index].width;
-    const size_t output_width = core->output_groups[pair_entry->output_index].width;
-    const size_t pair_weights = input_width * output_width;
+    const size_t output_width = core->output_groups[pair_entry->output_index].route_lut.bitmap_width;
+    const size_t pair_weights = (size_t)input_width * output_width;
     return pair_entry->weight_offset <= core->weight_count && pair_weights <= core->weight_count - pair_entry->weight_offset;
 }
 
@@ -53,15 +52,13 @@ void nmc_core_init(NmcCore *core, nmc_core_id_t core_id, int16_t *weights, size_
     core->weight_count = weight_count;
 }
 
-bool nmc_core_add_input_group(NmcCore *core, nmc_tile_width_t width)
+bool nmc_core_add_input_group(NmcCore *core)
 {
-    if (!valid_width(width) || core->input_group_count >= NMC_MAX_INPUT_GROUPS) {
+    if (core->input_group_count >= NMC_MAX_INPUT_GROUPS) {
         return false;
     }
 
-    core->input_groups[core->input_group_count++] = (NmcInputGroup){
-        .width = width,
-    };
+    core->input_groups[core->input_group_count++] = (NmcInputGroup){0};
     return true;
 }
 
@@ -73,7 +70,7 @@ bool nmc_core_add_output_group(NmcCore *core, nmc_tile_width_t width, const int3
 
     NmcOutputGroup *group = &core->output_groups[core->output_group_count++];
     memset(group, 0, sizeof(*group));
-    group->width = width;
+    group->route_lut.bitmap_width = width;
     for (nmc_tile_width_t i = 0; i < width; ++i) {
         group->neurons[i].threshold = thresholds ? thresholds[i] : 1;
     }
@@ -147,13 +144,6 @@ bool nmc_core_set_input_lut_range(NmcCore *core,
     input_group->lut.valid = true;
     input_group->lut.start = pair_start;
     input_group->lut.end = pair_end;
-    for (size_t i = pair_start; i < pair_end; ++i) {
-        if (!pair_weights_fit(core, input_index, &core->input_output_pair_lut[i])) {
-            input_group->lut = (NmcIndirectAddress){0};
-            return false;
-        }
-    }
-
     return true;
 }
 
@@ -181,16 +171,16 @@ bool nmc_core_add_input_output_pair_lut_entry(NmcCore *core,
 }
 
 static void accumulate_pair(NmcCore *core,
-                            const NmcInputGroup *input_group,
+                            nmc_tile_width_t input_width,
                             const NmcInputOutputPairLutEntry *pair_entry,
                             NmcOutputGroup *output_group,
                             const uint8_t *input_payload)
 {
-    for (size_t out = 0; out < output_group->width; ++out) {
+    for (size_t out = 0; out < output_group->route_lut.bitmap_width; ++out) {
         int32_t sum = 0;
-        for (size_t in = 0; in < input_group->width; ++in) {
+        for (size_t in = 0; in < input_width; ++in) {
             if (payload_bit_is_set(input_payload, in)) {
-                const size_t weight_index = pair_entry->weight_offset + out * input_group->width + in;
+                const size_t weight_index = pair_entry->weight_offset + out * input_width + in;
                 sum += core->weights[weight_index];
             }
         }
@@ -260,8 +250,8 @@ static bool enqueue_network_tile(NmcCore *core, const NmcOutputGroup *group, con
     NmcNetworkTile *tile = &core->output_queue[core->output_queue_count++];
     memset(tile, 0, sizeof(*tile));
     tile->destination_count = (uint8_t)(group->route_lut.predecessor_start - group->route_lut.successor_start);
-    tile->width = group->width;
-    memcpy(tile->payload, payload, payload_bytes(group->width));
+    tile->width = group->route_lut.bitmap_width;
+    memcpy(tile->payload, payload, payload_bytes(group->route_lut.bitmap_width));
 
     size_t destination_index = 0u;
     for (size_t i = group->route_lut.successor_start; i < group->route_lut.predecessor_start; ++i) {
@@ -282,7 +272,7 @@ static bool activate_output_group(NmcCore *core, nmc_output_index_t output_index
     }
 
     uint8_t payload[NMC_MAX_GROUP_BYTES] = {0};
-    for (nmc_tile_width_t i = 0; i < group->width; ++i) {
+    for (nmc_tile_width_t i = 0; i < group->route_lut.bitmap_width; ++i) {
         if (group->neurons[i].accumulator >= group->neurons[i].threshold) {
             payload_set_bit(payload, i);
         }
@@ -305,12 +295,12 @@ bool nmc_core_flush_ready_outputs(NmcCore *core)
 
 bool nmc_core_process_input_tile(NmcCore *core, const NmcInputTile *tile)
 {
-    if (!valid_input_index(core, tile->group_index)) {
+    if (!valid_input_index(core, tile->group_index) || !valid_width(tile->width)) {
         return false;
     }
 
     const NmcInputGroup *input_group = &core->input_groups[tile->group_index];
-    if (!input_group->lut.valid || tile->width != input_group->width) {
+    if (!input_group->lut.valid) {
         return false;
     }
 
@@ -320,13 +310,16 @@ bool nmc_core_process_input_tile(NmcCore *core, const NmcInputTile *tile)
         if (!valid_output_index(core, pair_entry->output_index)) {
             return false;
         }
+        if (!pair_weights_fit(core, tile->width, pair_entry)) {
+            return false;
+        }
 
         NmcOutputGroup *output_group = &core->output_groups[pair_entry->output_index];
         if (output_group->remaining_input_count == 0u) {
             return false;
         }
 
-        accumulate_pair(core, input_group, pair_entry, output_group, tile->payload);
+        accumulate_pair(core, tile->width, pair_entry, output_group, tile->payload);
         --output_group->remaining_input_count;
         matched = true;
 

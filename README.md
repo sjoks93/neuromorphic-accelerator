@@ -14,13 +14,14 @@ The current implementation focuses on the **input interface**, **output interfac
   - stage 1: the input index indexes the input group table
   - stage 1 output: start/end addresses into the stage-2 LUT
   - stage 2: each address is one input/output pair and stores the output index plus the starting address of the contiguous weight matrix slice
+  - the input bitmap width is not stored in the input group table; it comes from the received tile header
 - The **output interface also uses a two-stage LUT**:
   - stage 1: the output index indexes the output group table
-  - stage 1 output: successor start, predecessor start, and predecessor end addresses into the stage-2 route LUT
+  - stage 1 output: output bitmap width plus successor start, predecessor start, and predecessor end addresses into the stage-2 route LUT
   - stage 2: route entries are ordered as `successors(G0), predecessors(G0), successors(G1), predecessors(G1), ...`
   - successor entries route output network tiles forward
   - predecessor entries route ACK/credit-return messages backward
-- The input group table uses a generic indirect address (`valid`, `start`, `end`) into the pair LUT; the output group table uses a route address (`valid`, `successor_start`, `predecessor_start`, `predecessor_end`) into the route LUT.
+- The input group table uses a generic indirect address (`valid`, `start`, `end`) into the pair LUT; the output group table uses a route address (`valid`, `bitmap_width`, `successor_start`, `predecessor_start`, `predecessor_end`) into the route LUT.
 - For every input-group / output-group pair, weights are stored contiguously in memory and referenced by the LUT.
 - When an input tile is received, every matching input/output pair is consumed once for the current step.
 - Each output group stores a compile-time input count and a runtime remaining-input counter.
@@ -31,8 +32,10 @@ The current implementation focuses on the **input interface**, **output interfac
 
 The current C model captures the core interface and execution semantics, while simplifying compute:
 
-- Input and output group widths are represented by byte-array payloads, allowing the maximum payload width to scale by changing `NMC_MAX_GROUP_NEURONS`.
-- Group widths must be positive multiples of 8 bits.
+- Bitmap payloads are represented as byte arrays, allowing the maximum payload width to scale by changing `NMC_MAX_GROUP_NEURONS`.
+- Input bitmap width is carried by the received input tile. The core does not duplicate that width in the input group table.
+- Output bitmap width is stored in the output route table so the output router can determine generated message length.
+- Tile widths must be positive multiples of 8 bits.
 - Weights are signed 16-bit integers in contiguous row-major matrices:
   - row = output neuron index
   - column = input neuron index
@@ -50,7 +53,8 @@ The current C model captures the core interface and execution semantics, while s
 For each activated output group:
 
 1. The zero-based output index directly indexes the output group table, which is the first-stage output LUT.
-2. The first-stage entry supplies three addresses into the second-stage route LUT:
+2. The first-stage entry supplies the output bitmap width and three addresses into the second-stage route LUT:
+  - `bitmap_width`
   - `successor_start`
   - `predecessor_start`
   - `predecessor_end`
@@ -128,13 +132,14 @@ For each received input tile:
 2. The tile's zero-based group index directly indexes the input group table, which is the first-stage LUT.
 3. The first-stage entry supplies:
   - the inclusive/exclusive range `[pair_start, pair_end)` in the second-stage pair LUT
-4. The core walks the second-stage pair LUT range.
-5. Each second-stage entry supplies:
+4. The input bitmap width is taken from the received tile header, not from the input group table.
+5. The core walks the second-stage pair LUT range.
+6. Each second-stage entry supplies:
   - output index
   - starting address of the contiguous weight matrix for this input/output pair
-6. The compute model consumes the input spikes against the addressed weight matrix.
-7. The output group's remaining-input counter decrements.
-8. If the counter reaches zero, the output group becomes ready; it emits a network tile when successor credits and output queue space are available.
+7. The compute model consumes the input spikes against the addressed weight matrix, using the received tile width as the input matrix dimension.
+8. The output group's remaining-input counter decrements.
+9. If the counter reaches zero, the output group becomes ready; it emits a network tile when successor credits and output queue space are available.
 
 ## Repository layout
 
@@ -166,13 +171,13 @@ make clean
 
 The demo instantiates one core with:
 
-- Two input groups at indices `0` and `1`, each eight neurons wide.
+- Two input groups at indices `0` and `1`; their widths are supplied by the incoming input tiles.
 - Two first-stage input group entries:
   - input index `0` maps to pair LUT range `[0, 2)`
   - input index `1` maps to pair LUT range `[2, 3)`
 - Two output groups:
-  - output index `0`, subscribed to both input groups
-  - output index `1`, subscribed only to input index `0`
+  - output index `0`, eight output neurons wide, subscribed to both input groups
+  - output index `1`, eight output neurons wide, subscribed only to input index `0`
 - Contiguous weight memory slices for each input/output pair.
 - Output route LUT entries ordered as successors then predecessors per output group:
   - output index `0`: successors target cores `1` and `2`, then predecessors input groups `0` and `1`

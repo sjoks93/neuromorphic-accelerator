@@ -98,8 +98,8 @@ int main(void)
     NmcCore core;
     nmc_core_init(&core, CORE_ID, weights, sizeof(weights) / sizeof(weights[0]));
 
-    CHECK(nmc_core_add_input_group(&core, INPUT_WIDTH));
-    CHECK(nmc_core_add_input_group(&core, INPUT_WIDTH));
+    CHECK(nmc_core_add_input_group(&core));
+    CHECK(nmc_core_add_input_group(&core));
 
     const int32_t thresholds_x[] = {2, 2, 2, 2, 2, 2, 2, 2};
     const int32_t thresholds_y[] = {1, 1, 1, 1, 1, 1, 1, 1};

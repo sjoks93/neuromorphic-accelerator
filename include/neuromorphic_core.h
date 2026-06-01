@@ -30,6 +30,7 @@ typedef struct {
 
 typedef struct {
     bool valid;
+    nmc_tile_width_t bitmap_width;
     size_t successor_start;
     size_t predecessor_start;
     size_t predecessor_end;
@@ -41,12 +42,10 @@ typedef struct {
 } NmcNeuron;
 
 typedef struct {
-    nmc_tile_width_t width;
     NmcIndirectAddress lut;
 } NmcInputGroup;
 
 typedef struct {
-    nmc_tile_width_t width;
     uint32_t input_count;
     uint32_t remaining_input_count;
     NmcNeuron neurons[NMC_MAX_GROUP_NEURONS];
@@ -112,7 +111,7 @@ typedef struct {
 } NmcCore;
 
 void nmc_core_init(NmcCore *core, nmc_core_id_t core_id, int16_t *weights, size_t weight_count);
-bool nmc_core_add_input_group(NmcCore *core, nmc_tile_width_t width);
+bool nmc_core_add_input_group(NmcCore *core);
 bool nmc_core_add_output_group(NmcCore *core, nmc_tile_width_t width, const int32_t *thresholds);
 bool nmc_core_set_output_lut_range(NmcCore *core,
                                    nmc_output_index_t output_index,
