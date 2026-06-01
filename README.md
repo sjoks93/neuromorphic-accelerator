@@ -49,7 +49,10 @@ The current C model captures the core interface and execution semantics, while s
   - column = input neuron index
 - Accumulators are signed 32-bit integers.
 - Output accumulator and threshold state are stored per output neuron.
-- For each active input bit, the corresponding column is added to each output neuron accumulator.
+- The current compute scheduler converts input bitmaps to non-zero event indices with an on-the-fly encoder before issuing weight operations.
+- The event scheduling strategy has a configurable output-channel parallelism. Each cycle broadcasts one event index to multiple output-neuron lanes in the same output group.
+- The scheduler prioritizes accumulator reuse by holding a block of output-neuron accumulators while traversing all non-zero input events for that block.
+- Weight matrices remain contiguous and row-major. For each output row, the scheduler calculates the row base for input `0` and adds the current event index: `weight_offset + output_index * input_width + event_index`.
 - Output activation thresholds accumulators into a spike bitmap.
 - Accumulators are reset after activation, modeling accumulator reuse.
 - The mapping stage records each output group's subscribed input requirement in the output group table. Runtime consumption increments the output group's input-tile counter instead of using consumed masks.
@@ -174,6 +177,45 @@ For each received ACK message:
 6. After ACK counters are updated, the core flushes any output groups that were complete but blocked by successor synchronization.
 7. Any output emitted by that flush immediately sends predecessor ACKs and starts the next synchronization window.
 
+## Compute scheduling model
+
+The initial compute model is deliberately simple after event generation. It does not yet model adder-tree reduction, SIMD lane details, or memory-bank conflicts, but it now includes configurable output-channel parallelism.
+
+The core now inserts an on-the-fly bitmap-to-event encoder between the input buffer and the compute engine:
+
+1. The input tile still arrives as a bitmap.
+2. The encoder has a `P`-bit priority search window, with `P = 8` in the current model.
+3. Each encoder cycle emits at most one non-zero event index from the current `P`-bit window.
+4. After an event is emitted, that bit is conceptually cleared and the next encoder cycle continues searching the rest of the same `P`-bit window.
+5. If the current `P`-bit window is all zero, it is immediately replaced by the next `P`-bit window in the same encoder cycle. This gives the useful skip behavior of a `2P` look-ahead path without a `2P`-wide priority encoder.
+
+For each input tile and each selected input/output pair, the compute engine uses this schedule:
+
+1. Select the output group from the input/output pair LUT.
+2. Select a block of up to `output_parallelism` output neurons from that output group.
+3. Hold those output accumulators locally.
+4. Traverse only the encoded non-zero event indices.
+5. In one cycle, broadcast the event index to all active output lanes in the block.
+6. Each active lane accesses its row base plus the same event offset and adds the weight into its held accumulator.
+7. Write the accumulator block back.
+8. Repeat the same ordered event-index walk for the next output block.
+
+The loop order is therefore output-block-major, then event-minor, then lane-minor:
+
+```text
+events = encode_nonzero_input_indices(bitmap)
+
+for output_base in range(0, output_width, output_parallelism):
+  active_lanes = min(output_parallelism, output_width - output_base)
+  for event_index in events:
+    for lane in active_lanes:
+      output = output_base + lane
+      row_base = weight_offset + output * input_width
+      accumulators[output] += weights[row_base + event_index]
+```
+
+This schedule reuses the selected output accumulator block across all non-zero input events before moving to the next output block. Weight matrices remain row-major; event indices are offsets into each contiguous row. With `output_parallelism = 1`, a sparse `8 x 8` input/output pair with three active events costs `24` compute cycles instead of the dense `64`. With `output_parallelism = 2`, the same pair costs `12` compute cycles, because two output neurons are updated per event cycle. If one input tile with three active events maps to two `8 x 8` output groups and `output_parallelism = 2`, the test bench expects `24` compute cycles for that tile. The encoder counters model one emitted spike per cycle inside a non-empty `P` window. They also count the final window check needed to determine that no more events remain in a finite tile, unless the last emitted event is already the final bit in the tile. For example, a three-event `8`-bit tile with later zero bits takes `4` encoder cycles. A separate look-ahead test uses a `32`-bit input with one late event to verify that an all-zero `P` window can be replaced immediately and reach the next `P` window in the same encoder cycle.
+
 ## Repository layout
 
 ```text
@@ -271,9 +313,9 @@ The multi-core test assumes external spike input enters from the west side throu
 
 ## Suggested next iterations
 
-1. Add explicit input-event parallelization with an adder-tree reduction model.
-2. Add SIMD output-neuron lanes and cycle-level scheduling.
-3. Add accumulator-bank allocation and reuse constraints.
-4. Add memory-bank layout constraints for contiguous weights.
+1. Add detailed SIMD lane timing beneath the current abstract output-channel parallelism.
+2. Add accumulator-bank allocation and reuse constraints.
+3. Add memory-bank layout constraints for parallel event-indexed row accesses.
+4. Add explicit input-event parallelization with an adder-tree reduction model.
 5. Turn the multi-core test harness into a reusable mesh fabric module.
 6. Add traces and tests for overlapping input windows.
