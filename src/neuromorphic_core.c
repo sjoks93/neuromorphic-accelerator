@@ -42,6 +42,12 @@ static void payload_set_bit(uint8_t *payload, size_t bit_index)
     payload[bit_index / NMC_BITS_PER_BYTE] |= (uint8_t)(UINT8_C(1) << (bit_index % NMC_BITS_PER_BYTE));
 }
 
+typedef struct {
+    nmc_tile_width_t events[NMC_MAX_GROUP_NEURONS];
+    uint32_t event_count;
+    uint64_t encoder_cycles;
+} NmcInputLaneEvents;
+
 /* Check that the contiguous input/output weight slice is inside weight SRAM. */
 static bool pair_weights_fit(const NmcCore *core, nmc_tile_width_t input_width, const NmcInputOutputPairLutEntry *pair_entry)
 {
@@ -61,6 +67,7 @@ void nmc_core_init(NmcCore *core, nmc_core_id_t core_id, int16_t *weights, size_
     core->weights = weights;
     core->weight_count = weight_count;
     core->output_parallelism = 1u;
+    core->input_parallelism = 1u;
 }
 
 bool nmc_core_set_output_parallelism(NmcCore *core, nmc_tile_width_t output_parallelism)
@@ -70,6 +77,16 @@ bool nmc_core_set_output_parallelism(NmcCore *core, nmc_tile_width_t output_para
     }
 
     core->output_parallelism = output_parallelism;
+    return true;
+}
+
+bool nmc_core_set_input_parallelism(NmcCore *core, nmc_tile_width_t input_parallelism)
+{
+    if (input_parallelism == 0u || input_parallelism > NMC_MAX_GROUP_NEURONS) {
+        return false;
+    }
+
+    core->input_parallelism = input_parallelism;
     return true;
 }
 
@@ -251,30 +268,31 @@ bool nmc_core_add_ack_output_pair_lut_entry(NmcCore *core,
  * This does not require a 2P-wide priority encoder, but it lets one encoder
  * cycle skip the current empty P bits and inspect the next P bits.
  */
-static bool encode_input_events(const uint8_t *input_payload,
-                                nmc_tile_width_t input_width,
-                                nmc_tile_width_t *events,
-                                uint32_t *event_count,
-                                uint64_t *encoder_cycles)
+static bool encode_input_lane_events(const uint8_t *input_payload,
+                                     nmc_tile_width_t input_width,
+                                     nmc_tile_width_t lane_start,
+                                     nmc_tile_width_t lane_width,
+                                     NmcInputLaneEvents *lane_events)
 {
-    if (!valid_width(input_width)) {
+    if (!valid_width(input_width) || lane_width == 0u || lane_start > input_width || lane_width > input_width - lane_start) {
         return false;
     }
 
-    *event_count = 0u;
-    *encoder_cycles = 0u;
+    lane_events->event_count = 0u;
+    lane_events->encoder_cycles = 0u;
     nmc_tile_width_t cursor = 0u;
-    while (cursor < input_width) {
+    while (cursor < lane_width) {
         const nmc_tile_width_t window_start = (nmc_tile_width_t)((cursor / NMC_EVENT_ENCODER_WINDOW) * NMC_EVENT_ENCODER_WINDOW);
-        const nmc_tile_width_t window_end = (nmc_tile_width_t)((window_start + NMC_EVENT_ENCODER_WINDOW) < input_width ?
+        const nmc_tile_width_t window_end = (nmc_tile_width_t)((window_start + NMC_EVENT_ENCODER_WINDOW) < lane_width ?
                                                                   (window_start + NMC_EVENT_ENCODER_WINDOW) :
-                                                                  input_width);
+                                                                  lane_width);
 
-        ++*encoder_cycles;
+        ++lane_events->encoder_cycles;
         bool found_event = false;
         for (nmc_tile_width_t bit = cursor; bit < window_end; ++bit) {
-            if (payload_bit_is_set(input_payload, bit)) {
-                events[(*event_count)++] = bit;
+            const nmc_tile_width_t global_bit = (nmc_tile_width_t)(lane_start + bit);
+            if (payload_bit_is_set(input_payload, global_bit)) {
+                lane_events->events[lane_events->event_count++] = global_bit;
                 cursor = (nmc_tile_width_t)(bit + 1u);
                 found_event = true;
                 break;
@@ -285,18 +303,19 @@ static bool encode_input_events(const uint8_t *input_payload,
         }
 
         const nmc_tile_width_t replacement_start = window_end;
-        if (replacement_start >= input_width) {
+        if (replacement_start >= lane_width) {
             break;
         }
 
         /* All current P bits were zero, so replace them with the next P bits immediately. */
-        const nmc_tile_width_t replacement_end = (nmc_tile_width_t)((replacement_start + NMC_EVENT_ENCODER_WINDOW) < input_width ?
+        const nmc_tile_width_t replacement_end = (nmc_tile_width_t)((replacement_start + NMC_EVENT_ENCODER_WINDOW) < lane_width ?
                                                                         (replacement_start + NMC_EVENT_ENCODER_WINDOW) :
-                                                                        input_width);
+                                                                        lane_width);
         cursor = replacement_end;
         for (nmc_tile_width_t bit = replacement_start; bit < replacement_end; ++bit) {
-            if (payload_bit_is_set(input_payload, bit)) {
-                events[(*event_count)++] = bit;
+            const nmc_tile_width_t global_bit = (nmc_tile_width_t)(lane_start + bit);
+            if (payload_bit_is_set(input_payload, global_bit)) {
+                lane_events->events[lane_events->event_count++] = global_bit;
                 cursor = (nmc_tile_width_t)(bit + 1u);
                 break;
             }
@@ -306,38 +325,80 @@ static bool encode_input_events(const uint8_t *input_payload,
     return true;
 }
 
+static bool encode_input_events(const NmcCore *core,
+                                const uint8_t *input_payload,
+                                nmc_tile_width_t input_width,
+                                NmcInputLaneEvents *lane_events,
+                                uint32_t *event_count,
+                                uint64_t *encoder_cycles)
+{
+    if (!valid_width(input_width) || core->input_parallelism == 0u || input_width < core->input_parallelism ||
+        (input_width % core->input_parallelism) != 0u) {
+        return false;
+    }
+
+    *event_count = 0u;
+    *encoder_cycles = 0u;
+    const nmc_tile_width_t lane_width = (nmc_tile_width_t)(input_width / core->input_parallelism);
+    for (nmc_tile_width_t lane = 0u; lane < core->input_parallelism; ++lane) {
+        const nmc_tile_width_t lane_start = (nmc_tile_width_t)(lane * lane_width);
+        if (!encode_input_lane_events(input_payload, input_width, lane_start, lane_width, &lane_events[lane])) {
+            return false;
+        }
+        *event_count += lane_events[lane].event_count;
+        if (*encoder_cycles < lane_events[lane].encoder_cycles) {
+            *encoder_cycles = lane_events[lane].encoder_cycles;
+        }
+    }
+
+    return true;
+}
+
 /*
- * Event-driven compute schedule: one non-zero event-weight operation per cycle.
+ * Event-driven compute schedule: one input-lane adder-tree reduction per cycle.
  *
  * The schedule still prioritizes accumulator reuse.  For one input/output pair,
- * the core holds a small block of output-neuron accumulators, walks the ordered
- * event list, and updates all lanes in the block for the same event in one
- * cycle.  Each lane accesses its row-major weight as base(input 0) + event_index:
+ * the core holds a small block of output-neuron accumulators, walks the per-lane
+ * event streams in lockstep, and updates all output lanes in the block in one
+ * cycle.  Each input lane accesses its row-major weight as base(input 0) + event_index:
  *
  *   row_base = weight_offset + output * input_width
  *   accumulator[lane] += weight[row_base + event_index]
  *
- * Event indices are generated in ascending order by the encoder, so each row's
- * weight accesses are monotonic offsets inside the contiguous row.  Zero input
- * columns no longer consume compute cycles.
+ * Event indices are generated in ascending order inside each reshaped input
+ * sub-tile.  Zero input columns no longer consume compute cycles, and up to M
+ * non-zero input weights are reduced by the adder tree per output lane per cycle.
  */
 static void accumulate_pair(NmcCore *core,
                             nmc_tile_width_t input_width,
                             const NmcInputOutputPairLutEntry *pair_entry,
                             NmcOutputGroup *output_group,
-                            const nmc_tile_width_t *events,
-                            uint32_t event_count)
+                            const NmcInputLaneEvents *lane_events)
 {
     const size_t output_parallelism = core->output_parallelism;
+    const size_t input_parallelism = core->input_parallelism;
+    uint32_t input_steps = 0u;
+    for (size_t input_lane = 0u; input_lane < input_parallelism; ++input_lane) {
+        if (input_steps < lane_events[input_lane].event_count) {
+            input_steps = lane_events[input_lane].event_count;
+        }
+    }
+
     for (size_t out_base = 0; out_base < output_group->route_lut.bitmap_width; out_base += output_parallelism) {
         const size_t remaining_outputs = output_group->route_lut.bitmap_width - out_base;
         const size_t active_lanes = remaining_outputs < output_parallelism ? remaining_outputs : output_parallelism;
-        for (uint32_t event = 0u; event < event_count; ++event) {
+        for (uint32_t input_step = 0u; input_step < input_steps; ++input_step) {
             for (size_t lane = 0u; lane < active_lanes; ++lane) {
                 const size_t out = out_base + lane;
                 const size_t row_base = pair_entry->weight_offset + out * input_width;
-                const size_t weight_index = row_base + events[event];
-                output_group->neurons[out].accumulator += core->weights[weight_index];
+                int32_t reduced_sum = 0;
+                for (size_t input_lane = 0u; input_lane < input_parallelism; ++input_lane) {
+                    if (input_step < lane_events[input_lane].event_count) {
+                        const size_t weight_index = row_base + lane_events[input_lane].events[input_step];
+                        reduced_sum += core->weights[weight_index];
+                    }
+                }
+                output_group->neurons[out].accumulator += reduced_sum;
             }
             ++core->last_input_tile_compute_cycles;
             ++core->total_compute_cycles;
@@ -535,10 +596,10 @@ bool nmc_core_process_input_tile(NmcCore *core, const NmcInputTile *tile)
     core->last_input_tile_encoder_cycles = 0u;
     core->last_input_tile_event_count = 0u;
 
-    nmc_tile_width_t events[NMC_MAX_GROUP_NEURONS];
+    NmcInputLaneEvents lane_events[NMC_MAX_GROUP_NEURONS];
     uint32_t event_count = 0u;
     uint64_t encoder_cycles = 0u;
-    if (!encode_input_events(tile->payload, tile->width, events, &event_count, &encoder_cycles)) {
+    if (!encode_input_events(core, tile->payload, tile->width, lane_events, &event_count, &encoder_cycles)) {
         return false;
     }
     core->last_input_tile_event_count = event_count;
@@ -569,7 +630,7 @@ bool nmc_core_process_input_tile(NmcCore *core, const NmcInputTile *tile)
         }
 
         /* One arrival contributes once to this output group's current step. */
-        accumulate_pair(core, tile->width, pair_entry, output_group, events, event_count);
+        accumulate_pair(core, tile->width, pair_entry, output_group, lane_events);
         ++output_group->input_count;
         matched = true;
 

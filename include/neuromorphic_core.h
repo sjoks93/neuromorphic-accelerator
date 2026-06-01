@@ -163,6 +163,7 @@ typedef struct {
     int16_t *weights;
     size_t weight_count;
     nmc_tile_width_t output_parallelism;
+    nmc_tile_width_t input_parallelism;
 
     NmcNetworkTile output_queue[NMC_MAX_OUTPUT_QUEUE];
     size_t output_queue_count;
@@ -170,7 +171,7 @@ typedef struct {
     NmcAckMessage ack_queue[NMC_MAX_ACK_QUEUE];
     size_t ack_queue_count;
 
-    /* Simple compute-schedule counters: one event broadcast per output-lane block per cycle. */
+    /* Compute-schedule counters: one input-lane adder-tree reduction per output-lane block per cycle. */
     uint64_t total_compute_cycles;
     uint64_t last_input_tile_compute_cycles;
     uint64_t total_encoder_cycles;
@@ -181,6 +182,7 @@ typedef struct {
 /* Configuration and runtime API. */
 void nmc_core_init(NmcCore *core, nmc_core_id_t core_id, int16_t *weights, size_t weight_count);
 bool nmc_core_set_output_parallelism(NmcCore *core, nmc_tile_width_t output_parallelism);
+bool nmc_core_set_input_parallelism(NmcCore *core, nmc_tile_width_t input_parallelism);
 bool nmc_core_add_input_group(NmcCore *core);
 bool nmc_core_add_ack_group(NmcCore *core);
 bool nmc_core_add_output_group(NmcCore *core, nmc_tile_width_t width, const int32_t *thresholds);

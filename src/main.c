@@ -122,13 +122,14 @@ static void print_output_counters(const NmcCore *core)
            output_y->ack_count);
 }
 
-/* Print the event-driven one-operation-per-cycle compute schedule counters. */
+/* Print the event-driven compute schedule counters. */
 static void print_compute_counters(const NmcCore *core)
 {
-    printf("compute schedule: events=%u encoder_cycles=%llu output_parallelism=%u last_input_tile_compute_cycles=%llu total_compute_cycles=%llu\n",
+    printf("compute schedule: events=%u encoder_cycles=%llu output_parallelism=%u input_parallelism=%u last_input_tile_compute_cycles=%llu total_compute_cycles=%llu\n",
            core->last_input_tile_event_count,
            (unsigned long long)core->last_input_tile_encoder_cycles,
            core->output_parallelism,
+           core->input_parallelism,
            (unsigned long long)core->last_input_tile_compute_cycles,
            (unsigned long long)core->total_compute_cycles);
 }
@@ -452,6 +453,7 @@ int main(void)
     NmcCore core;
     nmc_core_init(&core, CORE_ID, weights, sizeof(weights) / sizeof(weights[0]));
     CHECK(nmc_core_set_output_parallelism(&core, 2u));
+    CHECK(nmc_core_set_input_parallelism(&core, 2u));
 
     /* Two input groups: A contributes to X and Y; B contributes only to X. */
     CHECK(nmc_core_add_input_group(&core));
@@ -528,8 +530,8 @@ int main(void)
     print_input_tile(&step0_a);
     CHECK(nmc_core_process_input_tile(&core, &step0_a));
     CHECK(core.last_input_tile_event_count == 3u);
-    CHECK(core.last_input_tile_encoder_cycles == 4u);
-    CHECK(core.last_input_tile_compute_cycles == 24u);
+    CHECK(core.last_input_tile_encoder_cycles == 3u);
+    CHECK(core.last_input_tile_compute_cycles == 16u);
     print_compute_counters(&core);
     CHECK(drain_outputs(&core) == 1u);
     CHECK(drain_acks(&core) == 1u);
@@ -539,8 +541,8 @@ int main(void)
     print_input_tile(&step0_b);
     CHECK(nmc_core_process_input_tile(&core, &step0_b));
     CHECK(core.last_input_tile_event_count == 3u);
-    CHECK(core.last_input_tile_encoder_cycles == 4u);
-    CHECK(core.last_input_tile_compute_cycles == 12u);
+    CHECK(core.last_input_tile_encoder_cycles == 2u);
+    CHECK(core.last_input_tile_compute_cycles == 8u);
     print_compute_counters(&core);
     CHECK(drain_outputs(&core) == 1u);
     CHECK(drain_acks(&core) == 1u);
@@ -590,8 +592,8 @@ int main(void)
     print_input_tile(&step2_b);
     CHECK(nmc_core_process_input_tile(&core, &step2_b));
     CHECK(core.last_input_tile_event_count == 2u);
-    CHECK(core.last_input_tile_encoder_cycles == 3u);
-    CHECK(core.last_input_tile_compute_cycles == 8u);
+    CHECK(core.last_input_tile_encoder_cycles == 2u);
+    CHECK(core.last_input_tile_compute_cycles == 4u);
     print_compute_counters(&core);
     CHECK(drain_outputs(&core) == 0u);
     CHECK(drain_acks(&core) == 0u);
@@ -637,6 +639,7 @@ int main(void)
     NmcCore encoder_core;
     nmc_core_init(&encoder_core, ENCODER_CORE_ID, encoder_weights, sizeof(encoder_weights) / sizeof(encoder_weights[0]));
     CHECK(nmc_core_set_output_parallelism(&encoder_core, 4u));
+    CHECK(nmc_core_set_input_parallelism(&encoder_core, 4u));
     CHECK(nmc_core_add_input_group(&encoder_core));
     CHECK(nmc_core_add_output_group(&encoder_core, ENCODER_OUTPUT_WIDTH, encoder_thresholds));
     CHECK(nmc_core_add_output_successor_lut_entry(&encoder_core, ENCODER_CORE_ID, ENCODER_INPUT));
@@ -653,7 +656,7 @@ int main(void)
     print_input_tile(&sparse_32_bit_tile);
     CHECK(nmc_core_process_input_tile(&encoder_core, &sparse_32_bit_tile));
     CHECK(encoder_core.last_input_tile_event_count == 1u);
-    CHECK(encoder_core.last_input_tile_encoder_cycles == 3u);
+    CHECK(encoder_core.last_input_tile_encoder_cycles == 2u);
     CHECK(encoder_core.last_input_tile_compute_cycles == 2u);
     print_compute_counters(&encoder_core);
     CHECK(drain_outputs(&encoder_core) == 1u);
@@ -741,6 +744,7 @@ int main(void)
     NmcCore source_core;
     nmc_core_init(&source_core, MULTI_SOURCE_CORE, source_weights, sizeof(source_weights) / sizeof(source_weights[0]));
     CHECK(nmc_core_set_output_parallelism(&source_core, 4u));
+    CHECK(nmc_core_set_input_parallelism(&source_core, 4u));
     CHECK(nmc_core_add_input_group(&source_core));
     CHECK(nmc_core_add_ack_group(&source_core));
     CHECK(nmc_core_add_output_group(&source_core, MULTI_WIDTH, multi_thresholds));
@@ -757,6 +761,7 @@ int main(void)
     NmcCore consumer_core;
     nmc_core_init(&consumer_core, MULTI_CONSUMER_CORE, consumer_weights, sizeof(consumer_weights) / sizeof(consumer_weights[0]));
     CHECK(nmc_core_set_output_parallelism(&consumer_core, 4u));
+    CHECK(nmc_core_set_input_parallelism(&consumer_core, 4u));
     CHECK(nmc_core_add_input_group(&consumer_core));
     CHECK(nmc_core_add_output_group(&consumer_core, MULTI_WIDTH, multi_thresholds));
     CHECK(nmc_core_add_output_successor_lut_entry(&consumer_core, MULTI_OBSERVER_CORE, MULTI_INPUT));
@@ -770,6 +775,7 @@ int main(void)
     NmcCore observer_core;
     nmc_core_init(&observer_core, MULTI_OBSERVER_CORE, observer_weights, sizeof(observer_weights) / sizeof(observer_weights[0]));
     CHECK(nmc_core_set_output_parallelism(&observer_core, 4u));
+    CHECK(nmc_core_set_input_parallelism(&observer_core, 4u));
     CHECK(nmc_core_add_input_group(&observer_core));
     CHECK(nmc_core_add_output_group(&observer_core, MULTI_WIDTH, multi_thresholds));
     CHECK(nmc_core_set_output_lut_starts(&observer_core, MULTI_OUTPUT, 0, 0));
@@ -791,8 +797,8 @@ int main(void)
     CHECK(nmc_router_route_message(&router_00, &side_input_step0));
     CHECK(deliver_router_local_to_core_expect(&router_00, &source_core, 1u, 0u));
     CHECK(source_core.last_input_tile_event_count == 4u);
-    CHECK(source_core.last_input_tile_encoder_cycles == 5u);
-    CHECK(source_core.last_input_tile_compute_cycles == 8u);
+    CHECK(source_core.last_input_tile_encoder_cycles == 2u);
+    CHECK(source_core.last_input_tile_compute_cycles == 4u);
     CHECK(inject_core_outputs_into_router_expect(&source_core, &router_00, mesh_map, mesh_map_count, 1u));
     CHECK(inject_core_acks_into_router_expect(&source_core, &router_00, mesh_map, mesh_map_count, 0u));
 
@@ -801,8 +807,8 @@ int main(void)
     CHECK(transfer_router_port_expect(&router_10, NMC_ROUTER_PORT_SOUTH, &router_11, 1u, 1u));
     CHECK(deliver_router_local_to_core_expect(&router_11, &consumer_core, 1u, 0u));
     CHECK(consumer_core.last_input_tile_event_count == 8u);
-    CHECK(consumer_core.last_input_tile_encoder_cycles == 8u);
-    CHECK(consumer_core.last_input_tile_compute_cycles == 16u);
+    CHECK(consumer_core.last_input_tile_encoder_cycles == 2u);
+    CHECK(consumer_core.last_input_tile_compute_cycles == 4u);
 
     begin_step("multi-core mesh: consumer emits to observer and ACKs the source");
     CHECK(inject_core_outputs_into_router_expect(&consumer_core, &router_11, mesh_map, mesh_map_count, 1u));
@@ -811,8 +817,8 @@ int main(void)
     CHECK(transfer_router_port_expect(&router_11, NMC_ROUTER_PORT_NORTH, &router_10, 1u, 1u));
     CHECK(deliver_router_local_to_core_expect(&router_10, &observer_core, 1u, 0u));
     CHECK(observer_core.last_input_tile_event_count == 8u);
-    CHECK(observer_core.last_input_tile_encoder_cycles == 8u);
-    CHECK(observer_core.last_input_tile_compute_cycles == 16u);
+    CHECK(observer_core.last_input_tile_encoder_cycles == 2u);
+    CHECK(observer_core.last_input_tile_compute_cycles == 4u);
     CHECK(observer_core.output_groups[MULTI_OUTPUT].input_count == 1u);
 
     CHECK(transfer_router_port_expect(&router_11, NMC_ROUTER_PORT_WEST, &router_01, 1u, 1u));
@@ -833,8 +839,8 @@ int main(void)
     CHECK(nmc_router_route_message(&router_00, &side_input_step1));
     CHECK(deliver_router_local_to_core_expect(&router_00, &source_core, 1u, 0u));
     CHECK(source_core.last_input_tile_event_count == 4u);
-    CHECK(source_core.last_input_tile_encoder_cycles == 4u);
-    CHECK(source_core.last_input_tile_compute_cycles == 8u);
+    CHECK(source_core.last_input_tile_encoder_cycles == 2u);
+    CHECK(source_core.last_input_tile_compute_cycles == 4u);
     CHECK(inject_core_outputs_into_router_expect(&source_core, &router_00, mesh_map, mesh_map_count, 1u));
 
     begin_step("multi-core mesh test bench passed");
