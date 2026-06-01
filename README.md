@@ -16,9 +16,11 @@ The current implementation focuses on the **input interface**, **output interfac
   - stage 2: each address is one input/output pair and stores the output index plus the starting address of the contiguous weight matrix slice
 - The **output interface also uses a two-stage LUT**:
   - stage 1: the output index indexes the output group table
-  - stage 1 output: start/end addresses into the stage-2 destination LUT
-  - stage 2: each address is one output destination and stores the target core ID plus the target group index used by that core
-- Input and output group tables share the same indirect addresser datatype: valid bit, start address, and end address.
+  - stage 1 output: successor start, predecessor start, and predecessor end addresses into the stage-2 route LUT
+  - stage 2: route entries are ordered as `successors(G0), predecessors(G0), successors(G1), predecessors(G1), ...`
+  - successor entries route output network tiles forward
+  - predecessor entries route ACK/credit-return messages backward
+- The input group table uses a generic indirect address (`valid`, `start`, `end`) into the pair LUT; the output group table uses a route address (`valid`, `successor_start`, `predecessor_start`, `predecessor_end`) into the route LUT.
 - For every input-group / output-group pair, weights are stored contiguously in memory and referenced by the LUT.
 - When an input tile is received, every matching input/output pair is consumed once for the current step.
 - Each output group stores a compile-time input count and a runtime remaining-input counter.
@@ -40,22 +42,33 @@ The current C model captures the core interface and execution semantics, while s
 - Output activation thresholds accumulators into a spike bitmap.
 - Accumulators are reset after activation, modeling accumulator reuse.
 - The mapping stage records each output group's subscribed input count in the output group table. Runtime consumption decrements this counter instead of using consumed masks.
+- Output successor route entries carry credit state. Credits are initialized as available, modeling an initially ready system.
+- Output activation produces routed predecessor ACK messages once the output network tile is accepted.
 
 ## Output-interface hardware mechanism
 
 For each activated output group:
 
 1. The zero-based output index directly indexes the output group table, which is the first-stage output LUT.
-2. The first-stage entry supplies the inclusive/exclusive range `[destination_start, destination_end)` in the second-stage destination LUT.
-3. The core walks the second-stage destination LUT range.
-4. Each destination entry supplies:
+2. The first-stage entry supplies three addresses into the second-stage route LUT:
+  - `successor_start`
+  - `predecessor_start`
+  - `predecessor_end`
+3. The successor route range is `[successor_start, predecessor_start)`.
+4. The predecessor ACK route range is `[predecessor_start, predecessor_end)`.
+5. Each successor entry supplies:
   - target core ID
   - target group index as interpreted by the target core
-5. The core emits one network tile containing:
+  - a credit bit indicating whether that successor ACKed the previous tile on this edge
+6. Each predecessor entry supplies:
+  - predecessor core ID
+  - predecessor group index to receive an ACK/credit-return message
+7. The core emits one network tile containing:
   - header field: number of destinations
   - header field: tile size / width
-  - header array: destination addresses, each `{core_id, group_index}`
+  - header array: successor destination addresses, each `{core_id, group_index}`
   - payload: spike bitmap with `width` bits
+8. After output injection succeeds, the core emits ACK messages to the predecessor route entries.
 
 ## Communication and tile consumption
 
@@ -83,6 +96,8 @@ Only after these conditions are true may the core emit the output tile and open 
 
 The successor ACK is therefore a **precondition for injection**, represented as credit on each outgoing destination edge. The core should not wait for a successor to process the just-sent tile before letting the tile leave; that would turn local flow control into a long end-to-end barrier. Instead, the successor processes the tile later and returns credit for the next tile on that same edge.
 
+The initial FSM state assumes every outgoing destination edge starts with one available credit. In other words, every successor is initially ready to accept the first activation.
+
 The proposed ACK/NACK pressure can be stated as follows:
 
 1. **Compile-time mapping records predecessors.** For each output group, the mapping stage records `input_count`. It must also be possible to enumerate the predecessor edges represented by that count: source core/group, destination core/group, and destination output group.
@@ -95,11 +110,14 @@ The proposed ACK/NACK pressure can be stated as follows:
 
 This makes the protocol equivalent to one in-flight tile per mapped predecessor edge. Natural succession comes from credit return order rather than explicit timestep fields. If the network can reorder traffic, the implementation should preserve per-edge ordering for data and ACK messages, or keep the one-credit rule strict enough that there is never more than one unacknowledged tile per edge.
 
+The current C model starts this mechanism by storing credit on output successor route entries and enqueueing routed predecessor ACK messages after successful output injection. A complete multi-core simulation should route these ACK messages back to predecessor cores and call credit-return logic when successors finish their downstream work.
+
 Important design gaps to resolve in the next implementation stage:
 
 - Whether back-pressure is **credit-based** (preferred for hardware) or explicit `NACK` retry.
 - Whether ACKs are sent per input/output pair, per input group after all local output consumers finish, or aggregated by routers for multicast fanout.
 - How output-network back-pressure is represented when an output group is complete but its network tile cannot yet be accepted.
+- How predecessor route entries are generated for remote cores during mapping.
 - How to avoid deadlock when recurrent/cyclic core graphs exist; at minimum, bounded queues and deterministic credit initialization are needed.
 
 ## Input-interface hardware mechanism
@@ -116,7 +134,7 @@ For each received input tile:
   - starting address of the contiguous weight matrix for this input/output pair
 6. The compute model consumes the input spikes against the addressed weight matrix.
 7. The output group's remaining-input counter decrements.
-8. If the counter reaches zero, the output group activates and emits a network tile.
+8. If the counter reaches zero, the output group becomes ready; it emits a network tile when successor credits and output queue space are available.
 
 ## Repository layout
 
@@ -156,9 +174,9 @@ The demo instantiates one core with:
   - output index `0`, subscribed to both input groups
   - output index `1`, subscribed only to input index `0`
 - Contiguous weight memory slices for each input/output pair.
-- Output destination LUT entries that map:
-  - output index `0` to target cores `1` and `2`, target group index `0`
-  - output index `1` to target core `3`, target group index `1`
+- Output route LUT entries ordered as successors then predecessors per output group:
+  - output index `0`: successors target cores `1` and `2`, then predecessors input groups `0` and `1`
+  - output index `1`: successor target core `3`, then predecessor input group `0`
 
 Expected behavior:
 
