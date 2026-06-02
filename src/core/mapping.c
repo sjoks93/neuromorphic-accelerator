@@ -73,6 +73,44 @@ static bool network_find_group(const NmcNetworkMappingSpec *network,
     return false;
 }
 
+static bool network_group_reaches(const NmcNetworkMappingSpec *network,
+                                  nmc_network_group_id_t current_group,
+                                  nmc_network_group_id_t target_group,
+                                  bool *visited)
+{
+    if (current_group == target_group) {
+        return true;
+    }
+
+    size_t current_index = 0u;
+    if (!network_find_group(network, current_group, &current_index)) {
+        return false;
+    }
+    if (visited[current_index]) {
+        return false;
+    }
+    visited[current_index] = true;
+
+    for (size_t i = 0u; i < network->connection_count; ++i) {
+        if (network->connections[i].source_group == current_group &&
+            network_group_reaches(network, network->connections[i].destination_group, target_group, visited)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool network_connection_is_recurrent(const NmcNetworkMappingSpec *network,
+                                            const NmcNetworkConnectionMappingSpec *connection)
+{
+    if (connection->recurrent || connection->source_group == connection->destination_group) {
+        return true;
+    }
+
+    bool visited[NMC_MAX_NETWORK_GROUPS] = {false};
+    return network_group_reaches(network, connection->destination_group, connection->source_group, visited);
+}
+
 static bool generated_find_group_location(NmcGeneratedMappings *generated,
                                           nmc_network_group_id_t group_id,
                                           NmcGeneratedGroupLocation *location)
@@ -94,7 +132,8 @@ static bool add_generated_output_input_entry(NmcGeneratedCoreMapping *destinatio
                                              nmc_output_index_t destination_output,
                                              nmc_input_index_t local_input,
                                              size_t weight_offset,
-                                             const int16_t *weights)
+                                             const int16_t *weights,
+                                             bool recurrent)
 {
     if ((size_t)destination_output >= destination_core->mapping.output_group_count ||
         (size_t)local_input >= destination_core->mapping.input_group_count) {
@@ -115,6 +154,7 @@ static bool add_generated_output_input_entry(NmcGeneratedCoreMapping *destinatio
         .input_group = local_input,
         .weight_offset = weight_offset,
         .weights = weights,
+        .recurrent = recurrent,
     };
     output->inputs = destination_core->output_inputs[destination_output];
     ++output->input_count;
@@ -128,6 +168,7 @@ static bool add_generated_input_connection(NmcGeneratedCoreMapping *destination_
                                            nmc_network_group_id_t destination_group,
                                            size_t weight_offset,
                                            const int16_t *weights,
+                                           bool recurrent,
                                            nmc_input_index_t *input_group)
 {
     if (destination_core->mapping.input_group_count >= NMC_MAX_INPUT_GROUPS ||
@@ -141,7 +182,7 @@ static bool add_generated_input_connection(NmcGeneratedCoreMapping *destination_
     destination_core->input_destination_group_ids[local_input] = destination_group;
     ++destination_core->mapping.input_group_count;
 
-    if (!add_generated_output_input_entry(destination_core, destination_output, local_input, weight_offset, weights)) {
+    if (!add_generated_output_input_entry(destination_core, destination_output, local_input, weight_offset, weights, recurrent)) {
         return false;
     }
     *input_group = local_input;
@@ -197,7 +238,8 @@ static bool add_generated_external_input_connection(NmcGeneratedCoreMapping *des
                                           destination_output,
                                           local_input,
                                           NMC_AUTO_WEIGHT_OFFSET,
-                                          weights)) {
+                                          weights,
+                                          false)) {
         return false;
     }
 
@@ -228,7 +270,8 @@ static bool add_generated_successor(NmcGeneratedCoreMapping *source_core,
 static bool add_generated_predecessor(NmcGeneratedCoreMapping *destination_core,
                                       nmc_output_index_t destination_output,
                                       nmc_core_id_t source_core_id,
-                                      nmc_ack_index_t source_ack_group)
+                                      nmc_ack_index_t source_ack_group,
+                                      bool recurrent)
 {
     if ((size_t)destination_output >= destination_core->mapping.output_group_count) {
         return false;
@@ -239,7 +282,11 @@ static bool add_generated_predecessor(NmcGeneratedCoreMapping *destination_core,
         return false;
     }
 
-    destination_core->output_predecessors[destination_output][output->predecessor_count] = NMC_PREDECESSOR(source_core_id, source_ack_group);
+    destination_core->output_predecessors[destination_output][output->predecessor_count] = (NmcPredecessorMappingSpec){
+        .core_id = source_core_id,
+        .ack_group = source_ack_group,
+        .recurrent = recurrent,
+    };
     output->predecessors = destination_core->output_predecessors[destination_output];
     ++output->predecessor_count;
     return true;
@@ -445,9 +492,14 @@ static bool configure_output_routes(NmcCore *core, const NmcCoreMappingSpec *map
 
         const size_t predecessor_start = core->output_route_lut_count;
         for (size_t i = 0u; i < spec->predecessor_count; ++i) {
-            if (!nmc_core_add_output_predecessor_lut_entry(core,
-                                                           spec->predecessors[i].core_id,
-                                                           spec->predecessors[i].ack_group)) {
+            const bool added = spec->predecessors[i].recurrent ?
+                nmc_core_add_recurrent_output_predecessor_lut_entry(core,
+                                                                    spec->predecessors[i].core_id,
+                                                                    spec->predecessors[i].ack_group) :
+                nmc_core_add_output_predecessor_lut_entry(core,
+                                                          spec->predecessors[i].core_id,
+                                                          spec->predecessors[i].ack_group);
+            if (!added) {
                 return false;
             }
         }
@@ -557,9 +609,14 @@ static bool configure_input_luts(NmcCore *core, const NmcCoreMappingSpec *mappin
                         return false;
                     }
                     copy_input_connection_weights(core, connection, weight_offset, weight_count);
-                    if (!nmc_core_add_input_output_pair_lut_entry(core,
-                                                                  (nmc_output_index_t)output_index,
-                                                                  weight_offset)) {
+                    const bool added = connection->recurrent ?
+                        nmc_core_add_recurrent_input_output_pair_lut_entry(core,
+                                                                          (nmc_output_index_t)output_index,
+                                                                          weight_offset) :
+                        nmc_core_add_input_output_pair_lut_entry(core,
+                                                                (nmc_output_index_t)output_index,
+                                                                weight_offset);
+                    if (!added) {
                         return false;
                     }
                 }
@@ -696,6 +753,7 @@ bool nmc_generate_core_mappings(const NmcNetworkMappingSpec *network, NmcGenerat
         NmcGeneratedGroupLocation source;
         NmcGeneratedGroupLocation destination;
         nmc_input_index_t destination_input = NMC_INVALID_INDEX;
+        const bool recurrent = network_connection_is_recurrent(network, &network->connections[i]);
         if (!network_find_group(network, network->connections[i].source_group, &source_group_index) ||
             !generated_find_group_location(generated, network->connections[i].source_group, &source) ||
             !generated_find_group_location(generated, network->connections[i].destination_group, &destination) ||
@@ -706,6 +764,7 @@ bool nmc_generate_core_mappings(const NmcNetworkMappingSpec *network, NmcGenerat
                                             network->connections[i].destination_group,
                                             NMC_AUTO_WEIGHT_OFFSET,
                                             network->connections[i].weights,
+                                            recurrent,
                                             &destination_input) ||
             !add_generated_successor(source.core, source.output_index, destination.core->core_id, destination_input)) {
             return false;
@@ -717,6 +776,7 @@ bool nmc_generate_core_mappings(const NmcNetworkMappingSpec *network, NmcGenerat
         NmcGeneratedGroupLocation source;
         NmcGeneratedGroupLocation destination;
         nmc_ack_index_t source_ack_group = NMC_INVALID_INDEX;
+        const bool recurrent = network_connection_is_recurrent(network, &network->connections[i]);
         if (!generated_find_group_location(generated, network->connections[i].source_group, &source) ||
             !generated_find_group_location(generated, network->connections[i].destination_group, &destination) ||
             !nmc_core_mapping_ack_group_for_successor(&source.core->mapping,
@@ -726,7 +786,8 @@ bool nmc_generate_core_mappings(const NmcNetworkMappingSpec *network, NmcGenerat
             !add_generated_predecessor(destination.core,
                                        destination.output_index,
                                        source.core->core_id,
-                                       source_ack_group)) {
+                                       source_ack_group,
+                                       recurrent)) {
             return false;
         }
     }

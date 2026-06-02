@@ -36,16 +36,6 @@ static bool output_group_predecessor_end(const NmcCore *core, nmc_output_index_t
     return route_lut->predecessor_start <= *predecessor_end && *predecessor_end <= core->output_route_lut_count;
 }
 
-static size_t output_group_predecessor_count(const NmcCore *core, nmc_output_index_t output_index)
-{
-    size_t predecessor_end = 0u;
-    if (!output_group_predecessor_end(core, output_index, &predecessor_end)) {
-        return 0u;
-    }
-
-    return predecessor_end - core->output_groups[output_index].route_lut.predecessor_start;
-}
-
 size_t nmc_core_output_group_successor_count(const NmcOutputGroup *group)
 {
     return group->route_lut.predecessor_start - group->route_lut.successor_start;
@@ -73,13 +63,19 @@ static bool output_group_destinations_ready(const NmcCore *core, nmc_output_inde
     return group->ack_count >= destination_count;
 }
 
-static bool enqueue_predecessor_acks(NmcCore *core, nmc_output_index_t output_index)
+static bool enqueue_predecessor_acks(NmcCore *core, nmc_output_index_t output_index, bool recurrent)
 {
     const NmcOutputRouteAddress *route_lut = &core->output_groups[output_index].route_lut;
-    const size_t predecessor_count = output_group_predecessor_count(core, output_index);
     size_t predecessor_end = 0u;
     if (!output_group_predecessor_end(core, output_index, &predecessor_end)) {
         return false;
+    }
+
+    size_t predecessor_count = 0u;
+    for (size_t i = route_lut->predecessor_start; i < predecessor_end; ++i) {
+        if (core->output_route_lut[i].recurrent == recurrent) {
+            ++predecessor_count;
+        }
     }
     if (predecessor_count > NMC_MAX_TILE_DESTINATIONS) {
         return false;
@@ -97,10 +93,45 @@ static bool enqueue_predecessor_acks(NmcCore *core, nmc_output_index_t output_in
     ack->destination_count = (uint8_t)predecessor_count;
     ack->completed_output_index = output_index;
 
+    size_t destination_index = 0u;
     for (size_t i = route_lut->predecessor_start; i < predecessor_end; ++i) {
-        ack->destinations[i - route_lut->predecessor_start] = core->output_route_lut[i].address;
+        if (core->output_route_lut[i].recurrent == recurrent) {
+            ack->destinations[destination_index++] = core->output_route_lut[i].address;
+        }
     }
 
+    return true;
+}
+
+static bool enqueue_recurrent_predecessor_acks_if_ready(NmcCore *core, nmc_output_index_t output_index)
+{
+    NmcOutputGroup *group = &core->output_groups[output_index];
+    if (!nmc_core_output_group_ready(group)) {
+        return false;
+    }
+    if (group->recurrent_ack_sent) {
+        return true;
+    }
+
+    /* The first recurrent window is seeded with an implicit all-zero state, so
+     * no real predecessor tile has been consumed and no recurrent credit is due. */
+    if (group->primed_recurrent_input_count == 0u && !enqueue_predecessor_acks(core, output_index, true)) {
+        return false;
+    }
+    group->recurrent_ack_sent = true;
+    return true;
+}
+
+static bool enqueue_predecessor_acks_if_activating(NmcCore *core, nmc_output_index_t output_index)
+{
+    NmcOutputGroup *group = &core->output_groups[output_index];
+    if (group->predecessor_ack_sent) {
+        return true;
+    }
+    if (!enqueue_predecessor_acks(core, output_index, false)) {
+        return false;
+    }
+    group->predecessor_ack_sent = true;
     return true;
 }
 
@@ -127,7 +158,9 @@ static bool enqueue_network_tile(NmcCore *core, nmc_output_index_t output_index,
 bool nmc_core_activate_output_group(NmcCore *core, nmc_output_index_t output_index)
 {
     NmcOutputGroup *group = &core->output_groups[output_index];
-    if (!output_group_destinations_ready(core, output_index)) {
+    if (!nmc_core_output_group_ready(group) ||
+        !enqueue_recurrent_predecessor_acks_if_ready(core, output_index) ||
+        !output_group_destinations_ready(core, output_index)) {
         return false;
     }
 
@@ -139,12 +172,12 @@ bool nmc_core_activate_output_group(NmcCore *core, nmc_output_index_t output_ind
     if (predecessor_count > NMC_MAX_TILE_DESTINATIONS) {
         return false;
     }
-    if (predecessor_count != 0u && core->ack_queue_count >= NMC_MAX_ACK_QUEUE) {
-        return false;
-    }
 
     size_t accumulator_start = 0u;
     if (!nmc_core_output_accumulators_fit(core, output_index, &accumulator_start)) {
+        return false;
+    }
+    if (!enqueue_predecessor_acks_if_activating(core, output_index)) {
         return false;
     }
 
@@ -159,13 +192,13 @@ bool nmc_core_activate_output_group(NmcCore *core, nmc_output_index_t output_ind
     if (!enqueue_network_tile(core, output_index, payload)) {
         return false;
     }
-    if (!enqueue_predecessor_acks(core, output_index)) {
-        return false;
-    }
 
     /* Start the next synchronization window. */
     group->input_count = 0u;
     group->ack_count = 0u;
+    group->primed_recurrent_input_count = 0u;
+    group->recurrent_ack_sent = false;
+    group->predecessor_ack_sent = false;
     return true;
 }
 
@@ -174,6 +207,9 @@ bool nmc_core_flush_ready_outputs(NmcCore *core)
     bool emitted = false;
     for (nmc_output_index_t output_index = 0u; output_index < core->output_group_count; ++output_index) {
         if (nmc_core_output_group_ready(&core->output_groups[output_index])) {
+            if (!enqueue_recurrent_predecessor_acks_if_ready(core, output_index)) {
+                continue;
+            }
             emitted = nmc_core_activate_output_group(core, output_index) || emitted;
         }
     }

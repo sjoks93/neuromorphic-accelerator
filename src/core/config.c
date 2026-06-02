@@ -89,7 +89,8 @@ bool nmc_core_set_output_lut_starts(NmcCore *core,
 
 static bool add_output_route_lut_entry(NmcCore *core,
                                        nmc_core_id_t core_id,
-                                       nmc_input_index_t group_index)
+                                       nmc_input_index_t group_index,
+                                       bool recurrent)
 {
     if (core->output_route_lut_count >= NMC_MAX_OUTPUT_ROUTE_LUT_ENTRIES) {
         return false;
@@ -100,6 +101,7 @@ static bool add_output_route_lut_entry(NmcCore *core,
             .core_id = core_id,
             .group_index = group_index,
         },
+        .recurrent = recurrent,
     };
     return true;
 }
@@ -108,14 +110,21 @@ bool nmc_core_add_output_successor_lut_entry(NmcCore *core,
                                              nmc_core_id_t target_core_id,
                                              nmc_input_index_t target_group_index)
 {
-    return add_output_route_lut_entry(core, target_core_id, target_group_index);
+    return add_output_route_lut_entry(core, target_core_id, target_group_index, false);
 }
 
 bool nmc_core_add_output_predecessor_lut_entry(NmcCore *core,
                                                nmc_core_id_t predecessor_core_id,
                                                nmc_input_index_t predecessor_group_index)
 {
-    return add_output_route_lut_entry(core, predecessor_core_id, predecessor_group_index);
+    return add_output_route_lut_entry(core, predecessor_core_id, predecessor_group_index, false);
+}
+
+bool nmc_core_add_recurrent_output_predecessor_lut_entry(NmcCore *core,
+                                                         nmc_core_id_t predecessor_core_id,
+                                                         nmc_input_index_t predecessor_group_index)
+{
+    return add_output_route_lut_entry(core, predecessor_core_id, predecessor_group_index, true);
 }
 
 bool nmc_core_set_input_lut_start(NmcCore *core,
@@ -148,9 +157,10 @@ bool nmc_core_set_ack_lut_start(NmcCore *core,
     return true;
 }
 
-bool nmc_core_add_input_output_pair_lut_entry(NmcCore *core,
-                                              nmc_output_index_t output_index,
-                                              size_t weight_offset)
+static bool add_input_output_pair_lut_entry(NmcCore *core,
+                                            nmc_output_index_t output_index,
+                                            size_t weight_offset,
+                                            bool recurrent)
 {
     if (core->input_output_pair_lut_count >= NMC_MAX_INPUT_OUTPUT_PAIR_LUT_ENTRIES) {
         return false;
@@ -163,11 +173,30 @@ bool nmc_core_add_input_output_pair_lut_entry(NmcCore *core,
     core->input_output_pair_lut[core->input_output_pair_lut_count++] = (NmcInputOutputPairLutEntry){
         .output_index = output_index,
         .weight_offset = weight_offset,
+        .recurrent = recurrent,
     };
 
     NmcOutputGroup *output_group = &core->output_groups[output_index];
     ++output_group->input_requirement;
+    if (recurrent) {
+        ++output_group->input_count;
+        ++output_group->primed_recurrent_input_count;
+    }
     return true;
+}
+
+bool nmc_core_add_input_output_pair_lut_entry(NmcCore *core,
+                                              nmc_output_index_t output_index,
+                                              size_t weight_offset)
+{
+    return add_input_output_pair_lut_entry(core, output_index, weight_offset, false);
+}
+
+bool nmc_core_add_recurrent_input_output_pair_lut_entry(NmcCore *core,
+                                                        nmc_output_index_t output_index,
+                                                        size_t weight_offset)
+{
+    return add_input_output_pair_lut_entry(core, output_index, weight_offset, true);
 }
 
 bool nmc_core_add_ack_output_pair_lut_entry(NmcCore *core,

@@ -22,6 +22,7 @@ Implemented today:
 - Two-stage ACK LUTs for successor synchronization returns.
 - Two-stage output route LUTs for successor tile destinations and predecessor ACK destinations.
 - Graph-level mapping generation from logical groups, external inputs, group-to-group connections, and core placement.
+- Recurrent/cyclic group connections, including initial zero-state priming and cycle-safe feedback credits.
 - Natural step ordering through ACK counters rather than explicit timestep tags.
 - Standalone XY/YX 2D mesh routing with multicast fanout splitting.
 - A small multi-core mesh scenario wired together in the test bench.
@@ -131,7 +132,7 @@ When a tile arrives:
 5. The output group's `input_count` is incremented.
 6. If all required inputs have arrived and successor synchronization is complete, the output group activates.
 
-Activation thresholds the output accumulators into a spike bitmap, resets the accumulator slice, and emits an `NmcNetworkTile` with one payload and a multicast destination list. After successful output injection, the core also emits one multicast `NmcAckMessage` to the predecessors that fed the completed output group.
+Activation thresholds the output accumulators into a spike bitmap, resets the accumulator slice, and emits an `NmcNetworkTile` with one payload and a multicast destination list. Feed-forward predecessor ACKs are emitted with activation; recurrent predecessor ACKs are emitted earlier when the destination input window completes.
 
 ACK messages are consumed through the ACK LUT rather than by directly naming an output group. This keeps ACK handling index-based in the same style as input-tile consumption:
 
@@ -146,7 +147,9 @@ The model avoids explicit timestep tags. Instead, it uses a one-in-flight style 
 - Input readiness is tracked by `input_count` versus `input_requirement` on each output group.
 - Successor synchronization is tracked by `ack_count` versus the number of successor route entries.
 - Output emission is allowed only when required inputs have arrived, successor ACKs for the previous emission have returned, and the output queue can accept the tile.
-- A successful emission immediately returns predecessor ACKs, allowing predecessors to send the next natural-step tile on those edges.
+- A successful emission returns predecessor ACKs, allowing predecessors to send the next natural-step tile on feed-forward edges.
+- Recurrent predecessor ACKs are returned as soon as the destination group has completed its input window. This breaks ACK cycles without a global timestep barrier: every feedback edge is still one-tile ordered, but its credit is no longer blocked behind the destination's own successor credits.
+- Recurrent input connections are primed with an implicit all-zero initial state during configuration. The first natural step can therefore run from external/feed-forward inputs, and later steps require real recurrent tiles.
 - New inputs may be consumed while the output is waiting for successor ACKs, but the next output tile cannot leave until those ACKs arrive.
 
 This models local ordering pressure without a global timestep barrier. A future fabric module can make this stricter by adding explicit NACK/BUSY retries, per-edge ordering checks, or more detailed queue back-pressure.
@@ -220,8 +223,10 @@ The core API exposes the complete state type `NmcCore`, message types, LUT entry
 | `nmc_core_set_output_accumulator_lut_start()` | Maps an output group to its accumulator SRAM base address and validates that the output slice fits. |
 | `nmc_core_add_output_successor_lut_entry()` | Appends a route LUT entry used as a successor destination for output spike tiles. |
 | `nmc_core_add_output_predecessor_lut_entry()` | Appends a route LUT entry used as a predecessor destination for generated ACK messages. |
+| `nmc_core_add_recurrent_output_predecessor_lut_entry()` | Appends a predecessor ACK destination whose credit is returned at input-window completion, for cycle-safe recurrent feedback. |
 | `nmc_core_set_output_lut_starts()` | Configures an output group's successor and predecessor route ranges.  Passing `output_index == output_group_count` configures the terminal sentinel. |
 | `nmc_core_add_input_output_pair_lut_entry()` | Appends one stage-2 input pair entry from an input group range to an output group and weight offset.  It also increments that output group's `input_requirement`. |
+| `nmc_core_add_recurrent_input_output_pair_lut_entry()` | Appends a recurrent stage-2 input pair and primes that input with an implicit zero state for the first natural step. |
 | `nmc_core_set_input_lut_start()` | Configures the stage-1 input LUT start for an input group or the terminal input sentinel. |
 | `nmc_core_add_ack_output_pair_lut_entry()` | Appends one stage-2 ACK pair entry.  One ACK index may therefore increment one or more output groups. |
 | `nmc_core_set_ack_lut_start()` | Configures the stage-1 ACK LUT start for an ACK group or the terminal ACK sentinel. |

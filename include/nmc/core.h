@@ -38,8 +38,10 @@
 #define NMC_AUTO_ACCUMULATOR_OFFSET SIZE_MAX
 #define NMC_INPUT_GROUP(width_) ((NmcInputGroupMappingSpec){.width = (width_)})
 #define NMC_INPUT_CONNECTION(input_group_, weights_) ((NmcInputConnectionMappingSpec){.input_group = (input_group_), .weight_offset = NMC_AUTO_WEIGHT_OFFSET, .weights = (weights_)})
+#define NMC_RECURRENT_INPUT_CONNECTION(input_group_, weights_) ((NmcInputConnectionMappingSpec){.input_group = (input_group_), .weight_offset = NMC_AUTO_WEIGHT_OFFSET, .weights = (weights_), .recurrent = true})
 #define NMC_SUCCESSOR(core_id_, input_group_) ((NmcOutputSuccessorMappingSpec){.core_id = (core_id_), .input_group = (input_group_)})
 #define NMC_PREDECESSOR(core_id_, ack_group_) ((NmcPredecessorMappingSpec){.core_id = (core_id_), .ack_group = (ack_group_)})
+#define NMC_RECURRENT_PREDECESSOR(core_id_, ack_group_) ((NmcPredecessorMappingSpec){.core_id = (core_id_), .ack_group = (ack_group_), .recurrent = true})
 
 typedef uint32_t nmc_core_id_t;
 typedef uint32_t nmc_network_group_id_t;
@@ -95,6 +97,9 @@ typedef struct {
     uint32_t input_requirement;
     uint32_t input_count;
     uint32_t ack_count;
+    uint32_t primed_recurrent_input_count;
+    bool recurrent_ack_sent;
+    bool predecessor_ack_sent;
     NmcNeuron neurons[NMC_MAX_GROUP_NEURONS];
     NmcOutputRouteAddress route_lut;
 } NmcOutputGroup;
@@ -103,6 +108,7 @@ typedef struct {
 typedef struct {
     nmc_output_index_t output_index;
     size_t weight_offset;
+    bool recurrent;
 } NmcInputOutputPairLutEntry;
 
 /*
@@ -129,6 +135,7 @@ typedef struct {
  */
 typedef struct {
     NmcDestinationAddress address;
+    bool recurrent;
 } NmcOutputRouteLutEntry;
 
 /* Router-facing ACK message: no payload, but the destination header is multicast. */
@@ -163,6 +170,7 @@ typedef struct {
     nmc_input_index_t input_group;
     size_t weight_offset;
     const int16_t *weights;
+    bool recurrent;
 } NmcInputConnectionMappingSpec;
 
 /* High-level declaration of one successor edge driven by an output group. */
@@ -175,6 +183,7 @@ typedef struct {
 typedef struct {
     nmc_core_id_t core_id;
     nmc_ack_index_t ack_group;
+    bool recurrent;
 } NmcPredecessorMappingSpec;
 
 /* High-level output group mapping specification. */
@@ -219,6 +228,7 @@ typedef struct {
     nmc_network_group_id_t source_group;
     nmc_network_group_id_t destination_group;
     const int16_t *weights;
+    bool recurrent;
 } NmcNetworkConnectionMappingSpec;
 
 /* Minimal graph-level mapping: logical groups, optional external inputs, and connections. */
@@ -312,6 +322,9 @@ bool nmc_core_add_output_successor_lut_entry(NmcCore *core,
 bool nmc_core_add_output_predecessor_lut_entry(NmcCore *core,
                                                nmc_core_id_t predecessor_core_id,
                                                nmc_input_index_t predecessor_group_index);
+bool nmc_core_add_recurrent_output_predecessor_lut_entry(NmcCore *core,
+                                                         nmc_core_id_t predecessor_core_id,
+                                                         nmc_input_index_t predecessor_group_index);
 bool nmc_core_set_input_lut_start(NmcCore *core,
                                   nmc_input_index_t input_index,
                                   size_t pair_start);
@@ -321,6 +334,9 @@ bool nmc_core_set_ack_lut_start(NmcCore *core,
 bool nmc_core_add_input_output_pair_lut_entry(NmcCore *core,
                                               nmc_output_index_t output_index,
                                               size_t weight_offset);
+bool nmc_core_add_recurrent_input_output_pair_lut_entry(NmcCore *core,
+                                                        nmc_output_index_t output_index,
+                                                        size_t weight_offset);
 bool nmc_core_add_ack_output_pair_lut_entry(NmcCore *core,
                                             nmc_output_index_t output_index);
 bool nmc_core_configure_mapping(NmcCore *core, nmc_core_id_t core_id, const NmcCoreMappingSpec *mapping);

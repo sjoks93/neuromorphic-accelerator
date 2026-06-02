@@ -773,6 +773,105 @@ int main(void)
 
     begin_step("graph mapper test bench passed");
 
+    begin_step("recurrent mapper: cyclic group connections use delayed feedback credits");
+    enum {
+        RECURRENT_INPUT_A = 10,
+        RECURRENT_INPUT_B = 11,
+        RECURRENT_GROUP_A = 200,
+        RECURRENT_GROUP_B = 201,
+        RECURRENT_CORE_A = 40,
+        RECURRENT_CORE_B = 41,
+        RECURRENT_WIDTH = 8,
+    };
+    const int32_t recurrent_thresholds[] = {1, 1, 1, 1, 1, 1, 1, 1};
+    int16_t recurrent_external_weights[RECURRENT_WIDTH * RECURRENT_WIDTH];
+    int16_t recurrent_feedback_weights[RECURRENT_WIDTH * RECURRENT_WIDTH];
+    fill_weights(recurrent_external_weights, ARRAY_COUNT(recurrent_external_weights));
+    fill_weights(recurrent_feedback_weights, ARRAY_COUNT(recurrent_feedback_weights));
+
+    const NmcNetworkGroupMappingSpec recurrent_groups[] = {
+        {.group_id = RECURRENT_GROUP_A, .core_id = RECURRENT_CORE_A, .width = RECURRENT_WIDTH, .thresholds = recurrent_thresholds},
+        {.group_id = RECURRENT_GROUP_B, .core_id = RECURRENT_CORE_B, .width = RECURRENT_WIDTH, .thresholds = recurrent_thresholds},
+    };
+    const NmcNetworkInputMappingSpec recurrent_inputs[] = {
+        {.input_id = RECURRENT_INPUT_A, .destination_group = RECURRENT_GROUP_A, .width = RECURRENT_WIDTH, .weights = recurrent_external_weights},
+        {.input_id = RECURRENT_INPUT_B, .destination_group = RECURRENT_GROUP_B, .width = RECURRENT_WIDTH, .weights = recurrent_external_weights},
+    };
+    const NmcNetworkConnectionMappingSpec recurrent_connections[] = {
+        {.source_group = RECURRENT_GROUP_A, .destination_group = RECURRENT_GROUP_B, .weights = recurrent_feedback_weights},
+        {.source_group = RECURRENT_GROUP_B, .destination_group = RECURRENT_GROUP_A, .weights = recurrent_feedback_weights},
+    };
+    const NmcNetworkMappingSpec recurrent_network = {
+        .groups = recurrent_groups,
+        .group_count = ARRAY_COUNT(recurrent_groups),
+        .inputs = recurrent_inputs,
+        .input_count = ARRAY_COUNT(recurrent_inputs),
+        .connections = recurrent_connections,
+        .connection_count = ARRAY_COUNT(recurrent_connections),
+    };
+    NmcGeneratedMappings recurrent_generated;
+    CHECK(nmc_generate_core_mappings(&recurrent_network, &recurrent_generated));
+    const NmcGeneratedCoreMapping *generated_recurrent_a = nmc_generated_mappings_find_core(&recurrent_generated, RECURRENT_CORE_A);
+    const NmcGeneratedCoreMapping *generated_recurrent_b = nmc_generated_mappings_find_core(&recurrent_generated, RECURRENT_CORE_B);
+    CHECK(generated_recurrent_a != NULL);
+    CHECK(generated_recurrent_b != NULL);
+    CHECK(generated_recurrent_a->mapping.output_groups[0].input_count == 2u);
+    CHECK(generated_recurrent_b->mapping.output_groups[0].input_count == 2u);
+    CHECK(generated_recurrent_a->mapping.output_groups[0].inputs[1].recurrent);
+    CHECK(generated_recurrent_b->mapping.output_groups[0].inputs[1].recurrent);
+    CHECK(generated_recurrent_a->mapping.output_groups[0].predecessors[0].recurrent);
+    CHECK(generated_recurrent_b->mapping.output_groups[0].predecessors[0].recurrent);
+
+    NmcCore recurrent_core_a;
+    NmcCore recurrent_core_b;
+    CHECK(nmc_core_configure_mapping(&recurrent_core_a, generated_recurrent_a->core_id, &generated_recurrent_a->mapping));
+    CHECK(nmc_core_configure_mapping(&recurrent_core_b, generated_recurrent_b->core_id, &generated_recurrent_b->mapping));
+    CHECK(recurrent_core_a.output_groups[0].input_count == 1u);
+    CHECK(recurrent_core_b.output_groups[0].input_count == 1u);
+    CHECK(recurrent_core_a.output_groups[0].primed_recurrent_input_count == 1u);
+    CHECK(recurrent_core_b.output_groups[0].primed_recurrent_input_count == 1u);
+
+    const NmcInputTile recurrent_external_a_step0 = {.width = RECURRENT_WIDTH, .group_index = 0u, .payload = {0x01u}};
+    const NmcInputTile recurrent_external_b_step0 = {.width = RECURRENT_WIDTH, .group_index = 0u, .payload = {0x02u}};
+    CHECK(nmc_core_process_input_tile(&recurrent_core_a, &recurrent_external_a_step0));
+    CHECK(nmc_core_process_input_tile(&recurrent_core_b, &recurrent_external_b_step0));
+
+    NmcNetworkTile recurrent_tile_a_to_b;
+    NmcNetworkTile recurrent_tile_b_to_a;
+    CHECK(nmc_core_pop_output_tile(&recurrent_core_a, &recurrent_tile_a_to_b));
+    CHECK(nmc_core_pop_output_tile(&recurrent_core_b, &recurrent_tile_b_to_a));
+    CHECK(recurrent_tile_a_to_b.destinations[0].core_id == RECURRENT_CORE_B);
+    CHECK(recurrent_tile_b_to_a.destinations[0].core_id == RECURRENT_CORE_A);
+    CHECK(drain_acks(&recurrent_core_a) == 0u);
+    CHECK(drain_acks(&recurrent_core_b) == 0u);
+
+    NmcInputTile recurrent_input_from_a;
+    NmcInputTile recurrent_input_from_b;
+    CHECK(nmc_network_tile_get_input_tile(&recurrent_tile_a_to_b, 0u, &recurrent_input_from_a));
+    CHECK(nmc_network_tile_get_input_tile(&recurrent_tile_b_to_a, 0u, &recurrent_input_from_b));
+    CHECK(nmc_core_process_input_tile(&recurrent_core_b, &recurrent_input_from_a));
+    CHECK(nmc_core_process_input_tile(&recurrent_core_a, &recurrent_input_from_b));
+
+    const NmcInputTile recurrent_external_a_step1 = {.width = RECURRENT_WIDTH, .group_index = 0u, .payload = {0x04u}};
+    const NmcInputTile recurrent_external_b_step1 = {.width = RECURRENT_WIDTH, .group_index = 0u, .payload = {0x08u}};
+    CHECK(nmc_core_process_input_tile(&recurrent_core_a, &recurrent_external_a_step1));
+    CHECK(nmc_core_process_input_tile(&recurrent_core_b, &recurrent_external_b_step1));
+    CHECK(!nmc_core_pop_output_tile(&recurrent_core_a, &recurrent_tile_b_to_a));
+    CHECK(!nmc_core_pop_output_tile(&recurrent_core_b, &recurrent_tile_a_to_b));
+
+    NmcAckMessage recurrent_ack_a_to_b;
+    NmcAckMessage recurrent_ack_b_to_a;
+    CHECK(nmc_core_pop_ack(&recurrent_core_a, &recurrent_ack_a_to_b));
+    CHECK(nmc_core_pop_ack(&recurrent_core_b, &recurrent_ack_b_to_a));
+    CHECK(recurrent_ack_a_to_b.destinations[0].core_id == RECURRENT_CORE_B);
+    CHECK(recurrent_ack_b_to_a.destinations[0].core_id == RECURRENT_CORE_A);
+    CHECK(nmc_core_process_ack(&recurrent_core_a, &recurrent_ack_b_to_a));
+    CHECK(nmc_core_process_ack(&recurrent_core_b, &recurrent_ack_a_to_b));
+    CHECK(nmc_core_pop_output_tile(&recurrent_core_a, &recurrent_tile_a_to_b));
+    CHECK(nmc_core_pop_output_tile(&recurrent_core_b, &recurrent_tile_b_to_a));
+
+    begin_step("recurrent mapper test bench passed");
+
     begin_step("standalone router: XY multicast splits by next-hop direction");
     NmcRouter xy_router;
     nmc_router_init(&xy_router, CORE_ID, (NmcMeshCoordinate){.x = 1, .y = 1}, NMC_ROUTER_XY);
