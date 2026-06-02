@@ -183,11 +183,20 @@ bool nmc_core_activate_output_group(NmcCore *core, nmc_output_index_t output_ind
 
     uint8_t payload[NMC_MAX_GROUP_BYTES] = {0};
     for (nmc_tile_width_t i = 0; i < group->route_lut.bitmap_width; ++i) {
-        int32_t *accumulator = &core->accumulators[accumulator_start + i];
-        if (*accumulator >= group->neurons[i].threshold) {
+        int32_t accumulator = 0;
+        if (!nmc_core_memory_read_accumulator(core,
+                                              accumulator_start,
+                                              i,
+                                              NMC_MEMORY_OUTPUT_TO_ACCUMULATOR_MUX,
+                                              &accumulator)) {
+            return false;
+        }
+        if (accumulator >= group->neurons[i].threshold) {
             nmc_core_payload_set_bit(payload, i);
         }
-        *accumulator = 0;
+        if (!nmc_core_memory_write_accumulator(core, accumulator_start, i, 0)) {
+            return false;
+        }
     }
     if (!enqueue_network_tile(core, output_index, payload)) {
         return false;

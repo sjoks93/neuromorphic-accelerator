@@ -33,6 +33,10 @@
 #define NMC_OUTPUT_PARALLELISM 4u
 #define NMC_WEIGHT_MEMORY_SIZE 1024u
 #define NMC_ACCUMULATOR_MEMORY_SIZE 1024u
+#define NMC_WEIGHT_LANE_BITS 16u
+#define NMC_ACCUMULATOR_BITS 32u
+#define NMC_ACCUMULATOR_LANES ((NMC_ACCUMULATOR_BITS + NMC_WEIGHT_LANE_BITS - 1u) / NMC_WEIGHT_LANE_BITS)
+#define NMC_UNIFIED_MEMORY_SIZE (NMC_WEIGHT_MEMORY_SIZE + (NMC_ACCUMULATOR_MEMORY_SIZE * NMC_ACCUMULATOR_LANES))
 #define NMC_INVALID_INDEX UINT32_MAX
 #define NMC_AUTO_WEIGHT_OFFSET SIZE_MAX
 #define NMC_AUTO_ACCUMULATOR_OFFSET SIZE_MAX
@@ -82,8 +86,9 @@ typedef struct {
     int32_t threshold;
 } NmcNeuron;
 
-/* Input group table entry: stage-1 input LUT. */
+/* Input group table entry: stage-1 input LUT plus optional configured width. */
 typedef struct {
+    nmc_tile_width_t width;
     NmcIndirectAddress lut;
 } NmcInputGroup;
 
@@ -104,7 +109,12 @@ typedef struct {
     NmcOutputRouteAddress route_lut;
 } NmcOutputGroup;
 
-/* Stage-2 input LUT entry: one input group contributes to one output group. */
+/*
+ * Stage-2 input LUT entry: one input group contributes to one output group.
+ *
+ * weight_offset points to input-bank-major weight SRAM.  For an input width N
+ * and output width M, bank/input i stores M consecutive output-channel weights.
+ */
 typedef struct {
     nmc_output_index_t output_index;
     size_t weight_offset;
@@ -165,7 +175,13 @@ typedef struct {
     nmc_tile_width_t width;
 } NmcInputGroupMappingSpec;
 
-/* High-level declaration of one input edge feeding an output group. */
+/*
+ * High-level declaration of one input edge feeding an output group.
+ *
+ * Caller-provided weights are conventional output-major matrices indexed as
+ * [output][input].  nmc_core_configure_mapping() transposes them into the
+ * core's input-bank-major, output-wide weight SRAM layout.
+ */
 typedef struct {
     nmc_input_index_t input_group;
     size_t weight_offset;
@@ -287,8 +303,7 @@ typedef struct {
     NmcOutputRouteLutEntry output_route_lut[NMC_MAX_OUTPUT_ROUTE_LUT_ENTRIES];
     size_t output_route_lut_count;
 
-    int16_t weights[NMC_WEIGHT_MEMORY_SIZE];
-    int32_t accumulators[NMC_ACCUMULATOR_MEMORY_SIZE];
+    int16_t memory[NMC_UNIFIED_MEMORY_SIZE];
 
     NmcNetworkTile output_queue[NMC_MAX_OUTPUT_QUEUE];
     size_t output_queue_count;

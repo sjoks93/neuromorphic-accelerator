@@ -41,12 +41,13 @@ bool nmc_core_set_output_accumulator_lut_start(NmcCore *core,
                                                nmc_output_index_t output_index,
                                                size_t accumulator_start)
 {
-    if (!nmc_core_valid_output_index(core, output_index) || accumulator_start >= NMC_ACCUMULATOR_MEMORY_SIZE) {
+    if (!nmc_core_valid_output_index(core, output_index) || accumulator_start >= NMC_UNIFIED_MEMORY_SIZE) {
         return false;
     }
 
     const size_t output_width = core->output_groups[output_index].route_lut.bitmap_width;
-    if (output_width > NMC_ACCUMULATOR_MEMORY_SIZE - accumulator_start) {
+    const size_t lane_span = nmc_core_accumulator_lane_span((nmc_tile_width_t)output_width);
+    if (lane_span > NMC_UNIFIED_MEMORY_SIZE - accumulator_start) {
         return false;
     }
 
@@ -166,7 +167,7 @@ static bool add_input_output_pair_lut_entry(NmcCore *core,
         return false;
     }
 
-    if (!nmc_core_valid_output_index(core, output_index) || weight_offset >= NMC_WEIGHT_MEMORY_SIZE) {
+    if (!nmc_core_valid_output_index(core, output_index) || weight_offset >= NMC_UNIFIED_MEMORY_SIZE) {
         return false;
     }
 

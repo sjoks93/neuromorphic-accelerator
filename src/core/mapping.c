@@ -364,26 +364,27 @@ bool nmc_core_mapping_ack_group_for_successor(const NmcCoreMappingSpec *mapping,
 }
 
 static bool output_accumulator_start(const NmcOutputGroupMappingSpec *spec,
-                                     size_t *next_accumulator_start,
+                                     size_t *next_memory_start,
                                      size_t *accumulator_start)
 {
+    const size_t accumulator_lane_span = nmc_core_accumulator_lane_span(spec->width);
     if (spec->accumulator_start == NMC_AUTO_ACCUMULATOR_OFFSET) {
-        if (*next_accumulator_start > NMC_ACCUMULATOR_MEMORY_SIZE ||
-            spec->width > NMC_ACCUMULATOR_MEMORY_SIZE - *next_accumulator_start) {
+        if (*next_memory_start > NMC_UNIFIED_MEMORY_SIZE ||
+            accumulator_lane_span > NMC_UNIFIED_MEMORY_SIZE - *next_memory_start) {
             return false;
         }
-        *accumulator_start = *next_accumulator_start;
+        *accumulator_start = *next_memory_start;
     } else {
-        if (spec->accumulator_start > NMC_ACCUMULATOR_MEMORY_SIZE ||
-            spec->width > NMC_ACCUMULATOR_MEMORY_SIZE - spec->accumulator_start) {
+        if (spec->accumulator_start > NMC_UNIFIED_MEMORY_SIZE ||
+            accumulator_lane_span > NMC_UNIFIED_MEMORY_SIZE - spec->accumulator_start) {
             return false;
         }
         *accumulator_start = spec->accumulator_start;
     }
 
-    const size_t accumulator_end = *accumulator_start + spec->width;
-    if (*next_accumulator_start < accumulator_end) {
-        *next_accumulator_start = accumulator_end;
+    const size_t accumulator_end = *accumulator_start + accumulator_lane_span;
+    if (*next_memory_start < accumulator_end) {
+        *next_memory_start = accumulator_end;
     }
     return true;
 }
@@ -442,17 +443,17 @@ static bool configure_input_groups(NmcCore *core, const NmcCoreMappingSpec *mapp
         if (!nmc_core_add_input_group(core)) {
             return false;
         }
+        core->input_groups[i].width = mapping->input_groups[i].width;
     }
     return true;
 }
 
-static bool configure_output_groups(NmcCore *core, const NmcCoreMappingSpec *mapping)
+static bool configure_output_groups(NmcCore *core, const NmcCoreMappingSpec *mapping, size_t *next_memory_start)
 {
-    size_t next_accumulator_start = 0u;
     for (size_t output_index = 0u; output_index < mapping->output_group_count; ++output_index) {
         const NmcOutputGroupMappingSpec *spec = &mapping->output_groups[output_index];
         size_t accumulator_start = 0u;
-        if (!output_accumulator_start(spec, &next_accumulator_start, &accumulator_start) ||
+        if (!output_accumulator_start(spec, next_memory_start, &accumulator_start) ||
             !nmc_core_add_output_group(core, spec->width, spec->thresholds) ||
             !nmc_core_set_output_accumulator_lut_start(core, (nmc_output_index_t)output_index, accumulator_start)) {
             return false;
@@ -558,12 +559,14 @@ static bool input_connection_weight_offset(const NmcCore *core,
     const size_t input_width = mapping->input_groups[connection->input_group].width;
     const size_t weight_count = output_width * input_width;
     if (connection->weight_offset == NMC_AUTO_WEIGHT_OFFSET) {
-        if (*next_weight_offset > NMC_WEIGHT_MEMORY_SIZE || weight_count > NMC_WEIGHT_MEMORY_SIZE - *next_weight_offset) {
+        if (*next_weight_offset > NMC_UNIFIED_MEMORY_SIZE || weight_count > NMC_UNIFIED_MEMORY_SIZE - *next_weight_offset) {
             return false;
         }
         *weight_offset = *next_weight_offset;
     } else {
-        if (connection->weight_offset > NMC_WEIGHT_MEMORY_SIZE || weight_count > NMC_WEIGHT_MEMORY_SIZE - connection->weight_offset) {
+        if (connection->weight_offset < *next_weight_offset ||
+            connection->weight_offset > NMC_UNIFIED_MEMORY_SIZE ||
+            weight_count > NMC_UNIFIED_MEMORY_SIZE - connection->weight_offset) {
             return false;
         }
         *weight_offset = connection->weight_offset;
@@ -579,16 +582,22 @@ static bool input_connection_weight_offset(const NmcCore *core,
 static void copy_input_connection_weights(NmcCore *core,
                                           const NmcInputConnectionMappingSpec *connection,
                                           size_t weight_offset,
-                                          size_t weight_count)
+                                          size_t input_width,
+                                          size_t output_width)
 {
     if (connection->weights != NULL) {
-        memcpy(&core->weights[weight_offset], connection->weights, weight_count * sizeof(core->weights[0]));
+        for (size_t input = 0u; input < input_width; ++input) {
+            for (size_t output = 0u; output < output_width; ++output) {
+                const size_t source_index = output * input_width + input;
+                const size_t banked_index = weight_offset + input * output_width + output;
+                core->memory[banked_index] = connection->weights[source_index];
+            }
+        }
     }
 }
 
-static bool configure_input_luts(NmcCore *core, const NmcCoreMappingSpec *mapping)
+static bool configure_input_luts(NmcCore *core, const NmcCoreMappingSpec *mapping, size_t next_weight_offset)
 {
-    size_t next_weight_offset = 0u;
     for (size_t input_index = 0u; input_index < core->input_group_count; ++input_index) {
         const size_t start = core->input_output_pair_lut_count;
         for (size_t output_index = 0u; output_index < mapping->output_group_count; ++output_index) {
@@ -599,7 +608,6 @@ static bool configure_input_luts(NmcCore *core, const NmcCoreMappingSpec *mappin
                     size_t weight_offset = 0u;
                     const size_t output_width = core->output_groups[output_index].route_lut.bitmap_width;
                     const size_t input_width = mapping->input_groups[input_index].width;
-                    const size_t weight_count = output_width * input_width;
                     if (!input_connection_weight_offset(core,
                                                         mapping,
                                                         (nmc_output_index_t)output_index,
@@ -608,7 +616,7 @@ static bool configure_input_luts(NmcCore *core, const NmcCoreMappingSpec *mappin
                                                         &weight_offset)) {
                         return false;
                     }
-                    copy_input_connection_weights(core, connection, weight_offset, weight_count);
+                    copy_input_connection_weights(core, connection, weight_offset, input_width, output_width);
                     const bool added = connection->recurrent ?
                         nmc_core_add_recurrent_input_output_pair_lut_entry(core,
                                                                           (nmc_output_index_t)output_index,
@@ -807,9 +815,10 @@ bool nmc_core_configure_mapping(NmcCore *core, nmc_core_id_t core_id, const NmcC
     }
 
     nmc_core_init(core, core_id);
+    size_t next_memory_start = 0u;
     return configure_input_groups(core, mapping) &&
-           configure_output_groups(core, mapping) &&
-           configure_input_luts(core, mapping) &&
+        configure_output_groups(core, mapping, &next_memory_start) &&
+        configure_input_luts(core, mapping, next_memory_start) &&
            configure_ack_groups(core, mapping) &&
            configure_output_routes(core, mapping) &&
            configure_ack_luts(core, mapping);

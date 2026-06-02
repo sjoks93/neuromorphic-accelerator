@@ -6,6 +6,11 @@ bool nmc_core_process_input_tile(NmcCore *core, const NmcInputTile *tile)
         return false;
     }
 
+    const NmcInputGroup *input_group = &core->input_groups[tile->group_index];
+    if (input_group->width != 0u && input_group->width != tile->width) {
+        return false;
+    }
+
     core->last_input_tile_compute_cycles = 0u;
     core->last_input_tile_encoder_cycles = 0u;
     core->last_input_tile_event_count = 0u;
@@ -21,7 +26,6 @@ bool nmc_core_process_input_tile(NmcCore *core, const NmcInputTile *tile)
     core->total_encoder_cycles += encoder_cycles;
 
     /* The following input-group entry provides the exclusive end of this range. */
-    const NmcInputGroup *input_group = &core->input_groups[tile->group_index];
     const NmcInputGroup *next_input_group = &core->input_groups[tile->group_index + 1u];
     if (!input_group->lut.valid || !next_input_group->lut.valid || input_group->lut.start > next_input_group->lut.start) {
         return false;

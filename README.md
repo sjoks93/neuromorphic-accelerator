@@ -15,9 +15,9 @@ Implemented today:
 
 - Input spike tiles as byte-array bitmaps.
 - Output spike tiles as multicast router-facing messages.
-- Per-output accumulator SRAM lookup and threshold activation.
+- Per-output accumulator lookup and threshold activation in unified lane memory.
 - Sparse bitmap-to-event encoding split across input lanes.
-- Output-neuron SIMD lane scheduling with accumulator reuse.
+- Unified memory with input-lane-banked, output-wide weights and packed multi-lane accumulators.
 - Two-stage input LUTs for spike-tile consumption.
 - Two-stage ACK LUTs for successor synchronization returns.
 - Two-stage output route LUTs for successor tile destinations and predecessor ACK destinations.
@@ -31,7 +31,7 @@ Still intentionally simplified:
 
 - The router and cores are connected by the test bench rather than by a reusable mesh-fabric module.
 - Queue back-pressure is represented by bounded arrays, but full retry/NACK behavior is not modeled yet.
-- Compute-cycle counters approximate the high-level SIMD/encoder schedule; memory-bank conflicts and lower-level pipeline timing are not yet modeled.
+- Compute-cycle counters approximate the high-level encoder and banked-memory schedule; lower-level pipeline timing is not yet modeled.
 - Full neural-network import/parsing is not modeled yet; callers provide a compact in-memory graph mapping spec.
 
 ## Repository layout
@@ -102,15 +102,15 @@ The default build uses strict warnings:
 
 An `NmcCore` models one accelerator core with local SRAM-like arrays and fixed maximum capacities. It has:
 
-- Input group table: first-stage lookup from a local input group index to a range in the input/output pair LUT.
+- Input group table: configured input width plus first-stage lookup from a local input group index to a range in the input/output pair LUT.
 - Input/output pair LUT: second-stage lookup entries that identify which output group receives the input and where that pair's contiguous weight matrix starts.
 - ACK group table: first-stage lookup from a local ACK group index to a range in the ACK/output pair LUT.
 - ACK/output pair LUT: second-stage lookup entries that increment successor-ACK counters on output groups.
 - Output group table: per-output thresholds, input readiness counters, successor ACK counters, and output route starts.
 - Output route LUT: successor destinations for output spike tiles followed by predecessor destinations for multicast ACKs.
-- Accumulator LUT: per-output starting addresses into accumulator SRAM.
-- Weight SRAM: signed 16-bit contiguous row-major matrices.
-- Accumulator SRAM: signed 32-bit output-neuron accumulators.
+- Accumulator LUT: per-output starting lane addresses into unified memory.
+- Unified memory: signed 16-bit lanes shared by input-bank-major weights and packed accumulator values.
+- Accumulator values: signed 32-bit membrane potentials packed across `NMC_ACCUMULATOR_LANES` neighboring weight lanes and selected through an accumulator MUX.
 - Output and ACK queues used by the surrounding router/fabric model.
 
 The core uses start-plus-terminal LUTs throughout. For example, input group `g` reads `start(g)` and `start(g + 1)` to find its exclusive second-stage LUT range. Output routes use the same idea, but each output has two starts: one for successor tile routes and one for predecessor ACK routes.
@@ -126,9 +126,9 @@ The core-facing input tile format is `NmcInputTile`:
 When a tile arrives:
 
 1. The input group index selects a range in the input/output pair LUT.
-2. Each pair entry selects an output group and a weight-matrix offset.
+2. Each pair entry selects an output group and a weight-bank base offset.
 3. The bitmap is converted into sparse input events.
-4. The selected row-major weight matrix is accumulated into that output group's accumulator slice.
+4. Each sparse input event selects one output-wide weight bank row and accumulates it into that output group's accumulator row.
 5. The output group's `input_count` is incremented.
 6. If all required inputs have arrived and successor synchronization is complete, the output group activates.
 
@@ -168,10 +168,13 @@ Input bitmap handling:
 
 Accumulation scheduling:
 
-- Output neurons are processed in blocks of `NMC_OUTPUT_PARALLELISM` lanes.
-- A block of accumulators is held while the model walks all sparse input-event steps for that block.
-- For each output lane and event step, up to `NMC_INPUT_PARALLELISM` weights are reduced and added to the output accumulator.
-- Weight matrices are contiguous and row-major: `weight_offset + output_index * input_width + event_index`.
+- For a connected input width N and output width M, the unified memory weight slice has N logical input banks/rows.
+- Each input bank row is M-wide: one sparse event selects all M weights for that input channel in one memory row.
+- The accumulator slice is M-wide logically, but each membrane potential occupies `NMC_ACCUMULATOR_LANES` 16-bit memory lanes.  With the default 32-bit accumulator and 16-bit weight lane, one membrane potential uses two lanes.
+- Accumulators are packed into rows of `NMC_INPUT_PARALLELISM` lanes.  The controller selects the accumulator MUX index for the requested output channel and reads or writes only the lanes needed for that one accumulator, leaving neighboring packed accumulators in the same row untouched.
+- During one event step, up to `NMC_INPUT_PARALLELISM` weight-bank rows are routed to the adder tree, reduced per output channel, and added to values read through the accumulator MUX.
+- The runtime banked weight address is `weight_offset + event_index * output_width + output_index`.
+- Caller-provided kernels in `NmcInputConnectionMappingSpec` remain conventional output-major matrices indexed as `[output][input]`; `nmc_core_configure_mapping()` transposes them into banked unified-memory lanes.
 
 The public counters on `NmcCore` expose the abstract schedule:
 
@@ -220,7 +223,7 @@ The core API exposes the complete state type `NmcCore`, message types, LUT entry
 | `nmc_core_add_input_group()` | Appends one input group table entry.  The terminal LUT start is configured separately with `nmc_core_set_input_lut_start()`. |
 | `nmc_core_add_ack_group()` | Appends one ACK group table entry.  ACK group indices are independent from input tile group indices. |
 | `nmc_core_add_output_group()` | Appends one output group, validates its bitmap width, and initializes per-neuron thresholds.  If `thresholds` is `NULL`, thresholds default to `1`. |
-| `nmc_core_set_output_accumulator_lut_start()` | Maps an output group to its accumulator SRAM base address and validates that the output slice fits. |
+| `nmc_core_set_output_accumulator_lut_start()` | Maps an output group to its accumulator base lane in unified memory and validates that the packed output slice fits. |
 | `nmc_core_add_output_successor_lut_entry()` | Appends a route LUT entry used as a successor destination for output spike tiles. |
 | `nmc_core_add_output_predecessor_lut_entry()` | Appends a route LUT entry used as a predecessor destination for generated ACK messages. |
 | `nmc_core_add_recurrent_output_predecessor_lut_entry()` | Appends a predecessor ACK destination whose credit is returned at input-window completion, for cycle-safe recurrent feedback. |
@@ -240,7 +243,7 @@ For new code, prefer `nmc_core_configure_mapping()` when the mapping is known up
 
 | Function | Behavior |
 | --- | --- |
-| `nmc_core_process_input_tile()` | Consumes one destination-local spike tile.  It validates the input group, encodes the bitmap into sparse events, walks the input/output pair range, accumulates into selected output groups, increments input counters, and attempts output activation when a group becomes complete. |
+| `nmc_core_process_input_tile()` | Consumes one destination-local spike tile.  It validates the input group and configured width, encodes the bitmap into sparse events, walks the input/output pair range, accumulates into selected output groups, increments input counters, and attempts output activation when a group becomes complete. |
 | `nmc_core_process_ack()` | Consumes one destination-local ACK message.  The ACK destination `group_index` is interpreted as an ACK LUT index.  Matching stage-2 entries increment successor-ACK counters and may flush outputs that were already input-complete. |
 | `nmc_core_flush_ready_outputs()` | Scans output groups and attempts to activate any group whose input counter has reached its configured requirement.  This is mainly used after ACK counters change. |
 | `nmc_core_pop_output_tile()` | Pops the oldest router-facing output spike tile from the core output queue. |
@@ -254,10 +257,11 @@ This module implements the public configuration half of the core API.  It owns g
 
 Key behavior:
 
-- `nmc_core_init()` zeroes the complete `NmcCore`, including queues, counters, LUTs, weights, and accumulators.
+- `nmc_core_init()` zeroes the complete `NmcCore`, including queues, counters, LUTs, and unified memory.
 - Group append functions enforce the fixed maxima from [include/nmc/core.h](include/nmc/core.h).
 - Output widths are validated through the shared width helper: widths must be positive, byte-aligned, and no larger than `NMC_MAX_GROUP_NEURONS`.
 - `nmc_core_set_output_lut_starts()` also initializes `ack_count` to the output group's successor count, modeling the initial state where no previous output tile is in flight.
+- `nmc_core_configure_mapping()` stores configured input widths on input groups so runtime tiles must match the N dimension used to lay out banked weight lanes.
 - `nmc_core_add_input_output_pair_lut_entry()` is the point where mapping metadata turns into an output group's `input_requirement`.
 
 ### High-level mapping module: [src/core/mapping.c](src/core/mapping.c)
@@ -269,10 +273,10 @@ Specification types:
 | Type | Meaning |
 | --- | --- |
 | `NmcInputGroupMappingSpec` | Describes one local input group width.  The array index is the local input `group_index`; use `NMC_INPUT_GROUP(width)` for concise declarations. |
-| `NmcInputConnectionMappingSpec` | Describes one local input group feeding an output group.  Use `NMC_INPUT_CONNECTION(input_group, weights)` and `NMC_AUTO_WEIGHT_OFFSET` to let the mapper place that input/output weight matrix.  If `weights` is non-`NULL`, the mapper copies that kernel into the assigned weight SRAM slice. |
+| `NmcInputConnectionMappingSpec` | Describes one local input group feeding an output group.  Use `NMC_INPUT_CONNECTION(input_group, weights)` and `NMC_AUTO_WEIGHT_OFFSET` to let the mapper place that input/output weight matrix.  If `weights` is non-`NULL`, provide it as an output-major `[output][input]` kernel; the mapper transposes it into input-bank-major, output-wide unified-memory lanes. |
 | `NmcOutputSuccessorMappingSpec` | Describes one successor edge driven by an output group as destination core plus destination-local input group.  The mapper automatically creates one local ACK group for each unique `(core_id, input_group)` successor endpoint. |
 | `NmcPredecessorMappingSpec` | Describes one predecessor ACK destination as predecessor core plus predecessor-local ACK group.  Use `nmc_core_mapping_ack_group_for_successor()` on the predecessor mapping to discover the ACK group generated for a successor endpoint. |
-| `NmcOutputGroupMappingSpec` | Describes one output group: bitmap width, optional thresholds, accumulator SRAM start, input edges, successor edges, and predecessor ACK destinations.  Use `NMC_AUTO_ACCUMULATOR_OFFSET` to let the mapper pack accumulator SRAM. |
+| `NmcOutputGroupMappingSpec` | Describes one output group: bitmap width, optional thresholds, accumulator base lane, input edges, successor edges, and predecessor ACK destinations.  Use `NMC_AUTO_ACCUMULATOR_OFFSET` to let the mapper pack accumulators in unified memory. |
 | `NmcCoreMappingSpec` | Describes the full static mapping for one core as local input groups plus output groups.  Input LUTs, ACK indices, weight offsets, route LUTs, input/output pair LUT entries, and ACK/output pair LUT entries are generated from those direct group-index connections. |
 | `NmcNetworkMappingSpec` | Describes a whole logical network using placed groups, optional external input edges, and group-to-group connections.  `nmc_generate_core_mappings()` lowers it into one `NmcCoreMappingSpec` per used core, automatically assigning local input group indices, ACK group indices, weight starts, accumulator starts, successor routes, and predecessor ACK routes.  Graph-level callers do not pass auto-generated offset sentinels. |
 
@@ -280,8 +284,8 @@ Specification types:
 
 1. Validate the top-level spec pointer and clear the target core with `nmc_core_init()`.
 2. Create local input groups exactly in the supplied input-group array order.
-3. Order output groups by their array order, add them to the core, and configure accumulator SRAM.  Outputs using `NMC_AUTO_ACCUMULATOR_OFFSET` are packed contiguously.
-4. Build the input/output pair LUT by inverting output input edges.  Connections using `NMC_AUTO_WEIGHT_OFFSET` are packed contiguously in weight memory, and non-`NULL` kernels are copied into the assigned slices.
+3. Order output groups by their array order, add them to the core, and configure packed accumulator slices in unified memory.  Outputs using `NMC_AUTO_ACCUMULATOR_OFFSET` are packed first.
+4. Build the input/output pair LUT by inverting output input edges.  Connections using `NMC_AUTO_WEIGHT_OFFSET` are packed after accumulator slices in the same unified memory, and non-`NULL` kernels are transposed from caller layout into banked weight slices.
 5. Assign local ACK group indices to each unique successor endpoint in first-seen order.  Reusing the same successor `(core_id, input_group)` from multiple outputs intentionally makes one incoming ACK fan out through the ACK/output pair LUT to all matching outputs.
 6. Build output router LUTs from successor input-group indices and predecessor ACK destinations.
 7. Build the ACK/output pair LUT by inverting output successor edges: every generated ACK group maps back to each output group that waits for that successor endpoint.
@@ -347,7 +351,7 @@ Behavior:
 3. Call `nmc_core_encode_input_events()` to convert the bitmap payload into per-lane sparse event streams.
 4. Read the current and next input LUT entries to obtain the pair range `[start(input), start(input + 1))`.
 5. For each pair entry, validate the target output group and weight slice.
-6. Call `nmc_core_accumulate_pair()` to update the selected output group's accumulator SRAM slice.
+6. Call `nmc_core_accumulate_pair()` to route active weight lanes to the adder tree, route packed accumulator lanes through the accumulator MUX, and update the selected output group's accumulator slice.
 7. Increment that output group's `input_count` once for this tile arrival.
 8. If the output group is input-complete, call `nmc_core_activate_output_group()`.  Activation may still fail harmlessly if successor ACK synchronization or queue space is not ready yet.
 
@@ -390,7 +394,7 @@ Implemented public or internal functions:
 | `nmc_core_pop_ack()` | FIFO pop from the predecessor ACK queue. |
 | `nmc_network_tile_get_input_tile()` | Converts one destination entry of a multicast network tile into a local input tile for the destination core. |
 
-Output activation is intentionally conservative: it checks successor route validity, predecessor route validity, destination count limits, output queue capacity, ACK queue capacity, and accumulator SRAM fit before mutating the output group synchronization window.
+Output activation is intentionally conservative: it checks successor route validity, predecessor route validity, destination count limits, output queue capacity, ACK queue capacity, and packed accumulator fit before mutating the output group synchronization window.
 
 ### Encoder module: [src/core/encoder.c](src/core/encoder.c)
 
@@ -412,8 +416,8 @@ Internal API:
 
 | Function | Behavior |
 | --- | --- |
-| `nmc_core_pair_weights_fit()` | Validates that an input/output pair's contiguous row-major weight matrix fits inside `NMC_WEIGHT_MEMORY_SIZE`. |
-| `nmc_core_accumulate_pair()` | Applies one encoded input tile to one input/output pair.  It walks output-neuron blocks of `NMC_OUTPUT_PARALLELISM`, walks sparse event steps across input lanes, sums active lane weights, updates accumulator SRAM, and advances compute-cycle counters. |
+| `nmc_core_pair_weights_fit()` | Validates that an input/output pair's contiguous banked weight matrix fits inside `NMC_UNIFIED_MEMORY_SIZE`. |
+| `nmc_core_accumulate_pair()` | Applies one encoded input tile to one input/output pair.  It walks sparse event steps across input lanes, routes weight lanes to the adder tree, routes packed accumulator lanes through the accumulator MUX, writes back only the selected accumulator lanes, and advances compute-cycle counters. |
 
 The compute module assumes the encoder has already produced per-lane event indices.  It does not inspect bitmap payloads directly.
 
@@ -432,7 +436,10 @@ Internal API:
 | `nmc_core_payload_bytes()` | Converts a bit width to the number of payload bytes. |
 | `nmc_core_payload_bit_is_set()` | Reads one little-endian bit from a payload byte array. |
 | `nmc_core_payload_set_bit()` | Sets one little-endian bit in a payload byte array. |
-| `nmc_core_output_accumulators_fit()` | Validates that an output group's accumulator LUT entry is valid and that the output slice fits in accumulator SRAM. |
+| `nmc_core_output_accumulators_fit()` | Validates that an output group's accumulator LUT entry is valid and that the packed output slice fits in unified memory. |
+| `nmc_core_memory_read_weight_lane()` | Routes one unified-memory lane to the adder tree for weight accumulation. |
+| `nmc_core_memory_read_accumulator()` | Routes only the selected packed accumulator lanes through the accumulator MUX and reconstructs one membrane potential. |
+| `nmc_core_memory_write_accumulator()` | Writes only the selected packed accumulator lanes back to unified memory. |
 | `nmc_print_payload()` | Public debug helper for printing payload bitmaps. |
 
 Payload bits are little-endian within each byte for storage and computation.  `nmc_print_payload()` reverses the display order so traces read like conventional binary literals.
@@ -484,6 +491,10 @@ The trace checks that:
 
 A sparse 32-bit input checks that the event encoder skips empty windows and still produces the expected event count, encoder-cycle count, and compute-cycle count.
 
+### Unified banked memory test
+
+A non-uniform 8x8 kernel checks that high-level output-major weights are transposed into input-bank-major unified-memory rows, that auto-placed weight slices start after packed accumulator slices, and that one sparse event step updates only the selected accumulator lanes through the accumulator MUX.
+
 ### Router and mesh tests
 
 The router tests check that:
@@ -513,10 +524,12 @@ The main hardware-style limits are defined in `include/nmc/core.h` and `include/
 | `NMC_MAX_ACK_GROUPS` | Maximum ACK input groups on one core. |
 | `NMC_MAX_OUTPUT_GROUPS` | Maximum output groups on one core. |
 | `NMC_MAX_TILE_DESTINATIONS` | Maximum multicast destinations in one tile or ACK message. |
-| `NMC_WEIGHT_MEMORY_SIZE` | Signed 16-bit weight SRAM entries per core. |
-| `NMC_ACCUMULATOR_MEMORY_SIZE` | Signed 32-bit accumulator SRAM entries per core. |
+| `NMC_WEIGHT_MEMORY_SIZE` | Legacy weight-lane capacity contribution to unified memory. |
+| `NMC_ACCUMULATOR_MEMORY_SIZE` | Legacy accumulator-value capacity contribution to unified memory. |
+| `NMC_ACCUMULATOR_LANES` | Number of 16-bit unified-memory lanes occupied by one accumulator value. |
+| `NMC_UNIFIED_MEMORY_SIZE` | Signed 16-bit memory lanes shared by weights and packed accumulators. |
 | `NMC_INPUT_PARALLELISM` | Number of input event lanes in the compute schedule. |
-| `NMC_OUTPUT_PARALLELISM` | Number of output-neuron lanes in the compute schedule. |
+| `NMC_OUTPUT_PARALLELISM` | Legacy output-lane knob retained for source compatibility; the current memory model updates each output group with its full M-wide accumulator row. |
 | `NMC_ROUTER_MAX_PORT_QUEUE` | Queue depth per router output port. |
 
 Tile widths must be positive multiples of 8 and no larger than `NMC_MAX_GROUP_NEURONS`.
@@ -535,7 +548,7 @@ Tile widths must be positive multiples of 8 and no larger than `NMC_MAX_GROUP_NE
 
 1. Extract the ad hoc mesh wiring in `src/main.c` into a reusable mesh-fabric module.
 2. Add explicit NACK/BUSY retry behavior for full queue back-pressure modeling.
-3. Model accumulator-bank allocation and memory-bank conflicts for the parallel event schedule.
+3. Model lower-level pipeline timing and bank conflict penalties for overloaded parallel event schedules.
 4. Add tests for overlapping input windows and convolution-like mappings.
 5. Add importers that produce `NmcNetworkMappingSpec` from common model or graph formats.
 6. Add deeper traces for deadlock-prone recurrent or cyclic core graphs.
