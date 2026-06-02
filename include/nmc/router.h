@@ -1,7 +1,7 @@
-#ifndef NEUROMORPHIC_ROUTER_H
-#define NEUROMORPHIC_ROUTER_H
+#ifndef NMC_ROUTER_H
+#define NMC_ROUTER_H
 
-#include "neuromorphic_core.h"
+#include "nmc/core.h"
 
 #include <stdbool.h>
 #include <stddef.h>

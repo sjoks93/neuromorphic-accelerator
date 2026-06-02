@@ -1,5 +1,5 @@
-#include "neuromorphic_core.h"
-#include "neuromorphic_router.h"
+#include "nmc/core.h"
+#include "nmc/router.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,25 +18,7 @@
     } \
 } while (0)
 
-/* Keep route indices symbolic so output routing tests are readable. */
-enum {
-    ROUTE_X_TO_CORE_1 = 0,
-    ROUTE_X_TO_CORE_2 = 1,
-    ROUTE_X_ACK_TO_PREDECESSOR_A = 2,
-    ROUTE_X_ACK_TO_PREDECESSOR_B = 3,
-    ROUTE_Y_TO_CORE_1 = 4,
-    ROUTE_Y_TO_CORE_3 = 5,
-    ROUTE_Y_ACK_TO_PREDECESSOR_A = 6,
-    ROUTE_TERMINAL = 7,
-};
-
-/* Incoming ACK group indices are a separate namespace from input tile groups. */
-enum {
-    ACK_FROM_CORE_1 = 0,
-    ACK_FROM_CORE_2 = 1,
-    ACK_FROM_CORE_3 = 2,
-    ACK_TERMINAL = 3,
-};
+#define ARRAY_COUNT(array) (sizeof(array) / sizeof((array)[0]))
 
 /* Print one router-facing multicast tile. */
 static void print_network_tile(const NmcNetworkTile *tile)
@@ -423,94 +405,92 @@ int main(void)
         CORE_ID = 0,
         INPUT_A = 0,
         INPUT_B = 1,
-        PREDECESSOR_A_ACK_INDEX = 0,
-        PREDECESSOR_B_ACK_INDEX = 1,
         OUTPUT_X = 0,
         OUTPUT_Y = 1,
+        ACK_FROM_CORE_1 = 0,
+        ACK_FROM_CORE_2 = 1,
+        ACK_FROM_CORE_3 = 2,
         INPUT_WIDTH = 8,
         OUTPUT_X_WIDTH = 8,
         OUTPUT_Y_WIDTH = 8,
-        OUTPUT_X_ACCUMULATOR_OFFSET = 0,
-        OUTPUT_Y_ACCUMULATOR_OFFSET = OUTPUT_X_ACCUMULATOR_OFFSET + OUTPUT_X_WIDTH,
-        OUTPUT_X_INPUT_A_OFFSET = 0,
-        OUTPUT_X_INPUT_B_OFFSET = OUTPUT_X_INPUT_A_OFFSET + OUTPUT_X_WIDTH * INPUT_WIDTH,
-        OUTPUT_Y_INPUT_A_OFFSET = OUTPUT_X_INPUT_B_OFFSET + OUTPUT_X_WIDTH * INPUT_WIDTH,
     };
 
     /*
-     * Contiguous weight memory:
-     *   offset   0: OUTPUT_X x INPUT_A, 8 outputs * 8 inputs
-     *   offset  64: OUTPUT_X x INPUT_B, 8 outputs * 8 inputs
-     *   offset 128: OUTPUT_Y x INPUT_A, 8 outputs * 8 inputs
-     *
-     * All weights are one, so each output neuron sees the input popcount.
+     * Weight matrices are auto-placed by the mapper.  All weights are one, so
+     * each output neuron sees the input popcount.
      */
-    /* Create one core under test. */
-    NmcCore core;
-    nmc_core_init(&core, CORE_ID);
-    fill_weights(core.weights, NMC_WEIGHT_MEMORY_SIZE);
-
-    /* Two input groups: A contributes to X and Y; B contributes only to X. */
-    CHECK(nmc_core_add_input_group(&core));
-    CHECK(nmc_core_add_input_group(&core));
-
-    /* Three ACK groups: core 1 is a common successor shared by X and Y. */
-    CHECK(nmc_core_add_ack_group(&core));
-    CHECK(nmc_core_add_ack_group(&core));
-    CHECK(nmc_core_add_ack_group(&core));
-
     /* X needs both inputs; Y needs only A. */
     const int32_t thresholds_x[] = {2, 2, 2, 2, 2, 2, 2, 2};
     const int32_t thresholds_y[] = {1, 1, 1, 1, 1, 1, 1, 1};
-    CHECK(nmc_core_add_output_group(&core, OUTPUT_X_WIDTH, thresholds_x));
-    CHECK(nmc_core_add_output_group(&core, OUTPUT_Y_WIDTH, thresholds_y));
-    CHECK(nmc_core_set_output_accumulator_lut_start(&core, OUTPUT_X, OUTPUT_X_ACCUMULATOR_OFFSET));
-    CHECK(nmc_core_set_output_accumulator_lut_start(&core, OUTPUT_Y, OUTPUT_Y_ACCUMULATOR_OFFSET));
+    int16_t weights_8x8[OUTPUT_X_WIDTH * INPUT_WIDTH];
+    fill_weights(weights_8x8, ARRAY_COUNT(weights_8x8));
+    const NmcInputGroupMappingSpec input_groups[] = {
+        [INPUT_A] = NMC_INPUT_GROUP(INPUT_WIDTH),
+        [INPUT_B] = NMC_INPUT_GROUP(INPUT_WIDTH),
+    };
+    const NmcInputConnectionMappingSpec output_x_inputs[] = {
+        NMC_INPUT_CONNECTION(INPUT_A, weights_8x8),
+        NMC_INPUT_CONNECTION(INPUT_B, weights_8x8),
+    };
+    const NmcOutputSuccessorMappingSpec output_x_successors[] = {
+        NMC_SUCCESSOR(1, 0),
+        NMC_SUCCESSOR(2, 0),
+    };
+    const NmcPredecessorMappingSpec output_x_predecessors[] = {
+        NMC_PREDECESSOR(CORE_ID, ACK_FROM_CORE_1),
+        NMC_PREDECESSOR(CORE_ID, ACK_FROM_CORE_2),
+    };
+    const NmcInputConnectionMappingSpec output_y_inputs[] = {
+        NMC_INPUT_CONNECTION(INPUT_A, weights_8x8),
+    };
+    const NmcOutputSuccessorMappingSpec output_y_successors[] = {
+        NMC_SUCCESSOR(1, 0),
+        NMC_SUCCESSOR(3, 1),
+    };
+    const NmcPredecessorMappingSpec output_y_predecessors[] = {
+        NMC_PREDECESSOR(CORE_ID, ACK_FROM_CORE_1),
+    };
+    const NmcOutputGroupMappingSpec output_groups[] = {
+        {
+            .width = OUTPUT_X_WIDTH,
+            .thresholds = thresholds_x,
+            .accumulator_start = NMC_AUTO_ACCUMULATOR_OFFSET,
+            .inputs = output_x_inputs,
+            .input_count = ARRAY_COUNT(output_x_inputs),
+            .successors = output_x_successors,
+            .successor_count = ARRAY_COUNT(output_x_successors),
+            .predecessors = output_x_predecessors,
+            .predecessor_count = ARRAY_COUNT(output_x_predecessors),
+        },
+        {
+            .width = OUTPUT_Y_WIDTH,
+            .thresholds = thresholds_y,
+            .accumulator_start = NMC_AUTO_ACCUMULATOR_OFFSET,
+            .inputs = output_y_inputs,
+            .input_count = ARRAY_COUNT(output_y_inputs),
+            .successors = output_y_successors,
+            .successor_count = ARRAY_COUNT(output_y_successors),
+            .predecessors = output_y_predecessors,
+            .predecessor_count = ARRAY_COUNT(output_y_predecessors),
+        },
+    };
+    const NmcCoreMappingSpec mapping = {
+        .input_groups = input_groups,
+        .input_group_count = ARRAY_COUNT(input_groups),
+        .output_groups = output_groups,
+        .output_group_count = ARRAY_COUNT(output_groups),
+    };
 
-    /*
-     * Stage-2 output route LUT, ordered as:
-     *   successors(X), predecessors(X), successors(Y), predecessors(Y)
-     */
-    CHECK(nmc_core_add_output_successor_lut_entry(&core, 1, 0));
-    CHECK(nmc_core_add_output_successor_lut_entry(&core, 2, 0));
-    CHECK(nmc_core_add_output_predecessor_lut_entry(&core, CORE_ID, PREDECESSOR_A_ACK_INDEX));
-    CHECK(nmc_core_add_output_predecessor_lut_entry(&core, CORE_ID, PREDECESSOR_B_ACK_INDEX));
-    CHECK(nmc_core_add_output_successor_lut_entry(&core, 1, 0));
-    CHECK(nmc_core_add_output_successor_lut_entry(&core, 3, 1));
-    CHECK(nmc_core_add_output_predecessor_lut_entry(&core, CORE_ID, PREDECESSOR_A_ACK_INDEX));
+    nmc_ack_index_t ack_from_core_1 = NMC_INVALID_INDEX;
+    nmc_ack_index_t ack_from_core_2 = NMC_INVALID_INDEX;
+    nmc_ack_index_t ack_from_core_3 = NMC_INVALID_INDEX;
+    CHECK(nmc_core_mapping_ack_group_for_successor(&mapping, 1, 0, &ack_from_core_1));
+    CHECK(nmc_core_mapping_ack_group_for_successor(&mapping, 2, 0, &ack_from_core_2));
+    CHECK(nmc_core_mapping_ack_group_for_successor(&mapping, 3, 1, &ack_from_core_3));
 
-    /*
-     * Stage-1 output starts.  The terminal entry at index 2 provides the
-     * exclusive end for OUTPUT_Y's predecessor range.
-     */
-    CHECK(nmc_core_set_output_lut_starts(&core, OUTPUT_X, ROUTE_X_TO_CORE_1, ROUTE_X_ACK_TO_PREDECESSOR_A));
-    CHECK(nmc_core_set_output_lut_starts(&core, OUTPUT_Y, ROUTE_Y_TO_CORE_1, ROUTE_Y_ACK_TO_PREDECESSOR_A));
-    CHECK(nmc_core_set_output_lut_starts(&core, 2, ROUTE_TERMINAL, ROUTE_TERMINAL));
-
-    /*
-     * Stage-2 ACK input LUT.  Each incoming ACK index increments one or more
-     * output-group ACK counters.
-     */
-    CHECK(nmc_core_add_ack_output_pair_lut_entry(&core, OUTPUT_X));
-    CHECK(nmc_core_add_ack_output_pair_lut_entry(&core, OUTPUT_Y));
-    CHECK(nmc_core_add_ack_output_pair_lut_entry(&core, OUTPUT_X));
-    CHECK(nmc_core_add_ack_output_pair_lut_entry(&core, OUTPUT_Y));
-
-    /* Stage-1 ACK starts plus terminal: core1->[0,2), core2->[2,3), core3->[3,4). */
-    CHECK(nmc_core_set_ack_lut_start(&core, ACK_FROM_CORE_1, 0));
-    CHECK(nmc_core_set_ack_lut_start(&core, ACK_FROM_CORE_2, 2));
-    CHECK(nmc_core_set_ack_lut_start(&core, ACK_FROM_CORE_3, 3));
-    CHECK(nmc_core_set_ack_lut_start(&core, ACK_TERMINAL, 4));
-
-    /* Stage-2 input/output pair LUT. */
-    CHECK(nmc_core_add_input_output_pair_lut_entry(&core, OUTPUT_X, OUTPUT_X_INPUT_A_OFFSET));
-    CHECK(nmc_core_add_input_output_pair_lut_entry(&core, OUTPUT_Y, OUTPUT_Y_INPUT_A_OFFSET));
-    CHECK(nmc_core_add_input_output_pair_lut_entry(&core, OUTPUT_X, OUTPUT_X_INPUT_B_OFFSET));
-
-    /* Stage-1 input starts plus terminal: A->[0,2), B->[2,3). */
-    CHECK(nmc_core_set_input_lut_start(&core, INPUT_A, 0));
-    CHECK(nmc_core_set_input_lut_start(&core, INPUT_B, 2));
-    CHECK(nmc_core_set_input_lut_start(&core, 2, 3));
+    /* Create one core under test. */
+    NmcCore core;
+    CHECK(nmc_core_configure_mapping(&core, CORE_ID, &mapping));
 
     /* Three natural steps with different payloads and arrival orders. */
     const NmcInputTile step0_a = {.width = INPUT_WIDTH, .group_index = INPUT_A, .payload = {0x15u}};
@@ -568,19 +548,19 @@ int main(void)
     print_output_counters(&core);
 
     begin_step("common successor ACK from core 1 advances both X and Y, but releases neither");
-    CHECK(process_successor_ack(&core, ACK_FROM_CORE_1));
+    CHECK(process_successor_ack(&core, ack_from_core_1));
     CHECK(drain_outputs(&core) == 0u);
     CHECK(drain_acks(&core) == 0u);
     print_output_counters(&core);
 
     begin_step("Y-only successor ACK from core 3 releases Y's pending step 1 output");
-    CHECK(process_successor_ack(&core, ACK_FROM_CORE_3));
+    CHECK(process_successor_ack(&core, ack_from_core_3));
     CHECK(drain_outputs(&core) == 1u);
     CHECK(drain_acks(&core) == 1u);
     print_output_counters(&core);
 
     begin_step("X-only successor ACK from core 2 releases X's pending step 1 output");
-    CHECK(process_successor_ack(&core, ACK_FROM_CORE_2));
+    CHECK(process_successor_ack(&core, ack_from_core_2));
     CHECK(drain_outputs(&core) == 1u);
     CHECK(drain_acks(&core) == 1u);
     print_output_counters(&core);
@@ -608,13 +588,13 @@ int main(void)
     print_output_counters(&core);
 
     begin_step("successor ACKs for step 1 flush the pending step 2 outputs");
-    CHECK(process_successor_ack(&core, ACK_FROM_CORE_1));
+    CHECK(process_successor_ack(&core, ack_from_core_1));
     CHECK(drain_outputs(&core) == 0u);
     CHECK(drain_acks(&core) == 0u);
-    CHECK(process_successor_ack(&core, ACK_FROM_CORE_3));
+    CHECK(process_successor_ack(&core, ack_from_core_3));
     CHECK(drain_outputs(&core) == 1u);
     CHECK(drain_acks(&core) == 1u);
-    CHECK(process_successor_ack(&core, ACK_FROM_CORE_2));
+    CHECK(process_successor_ack(&core, ack_from_core_2));
     CHECK(drain_outputs(&core) == 1u);
     CHECK(drain_acks(&core) == 1u);
     print_output_counters(&core);
@@ -624,24 +604,42 @@ int main(void)
     begin_step("event encoder: P-wide search replaces an empty window before a sparse event");
     enum {
         ENCODER_CORE_ID = 20,
-        ENCODER_INPUT = 0,
         ENCODER_OUTPUT = 0,
+        ENCODER_INPUT = 0,
         ENCODER_INPUT_WIDTH = 32,
         ENCODER_OUTPUT_WIDTH = 8,
     };
     const int32_t encoder_thresholds[] = {1, 1, 1, 1, 1, 1, 1, 1};
+    int16_t encoder_weights[ENCODER_OUTPUT_WIDTH * ENCODER_INPUT_WIDTH];
+    fill_weights(encoder_weights, ARRAY_COUNT(encoder_weights));
     NmcCore encoder_core;
-    nmc_core_init(&encoder_core, ENCODER_CORE_ID);
-    fill_weights(encoder_core.weights, NMC_WEIGHT_MEMORY_SIZE);
-    CHECK(nmc_core_add_input_group(&encoder_core));
-    CHECK(nmc_core_add_output_group(&encoder_core, ENCODER_OUTPUT_WIDTH, encoder_thresholds));
-    CHECK(nmc_core_set_output_accumulator_lut_start(&encoder_core, ENCODER_OUTPUT, 0));
-    CHECK(nmc_core_add_output_successor_lut_entry(&encoder_core, ENCODER_CORE_ID, ENCODER_INPUT));
-    CHECK(nmc_core_set_output_lut_starts(&encoder_core, ENCODER_OUTPUT, 0, 1));
-    CHECK(nmc_core_set_output_lut_starts(&encoder_core, 1, 1, 1));
-    CHECK(nmc_core_add_input_output_pair_lut_entry(&encoder_core, ENCODER_OUTPUT, 0));
-    CHECK(nmc_core_set_input_lut_start(&encoder_core, ENCODER_INPUT, 0));
-    CHECK(nmc_core_set_input_lut_start(&encoder_core, 1, 1));
+    const NmcInputGroupMappingSpec encoder_inputs[] = {
+        [ENCODER_INPUT] = NMC_INPUT_GROUP(ENCODER_INPUT_WIDTH),
+    };
+    const NmcInputConnectionMappingSpec encoder_output_inputs[] = {
+        NMC_INPUT_CONNECTION(ENCODER_INPUT, encoder_weights),
+    };
+    const NmcOutputSuccessorMappingSpec encoder_successors[] = {
+        NMC_SUCCESSOR(ENCODER_CORE_ID, ENCODER_INPUT),
+    };
+    const NmcOutputGroupMappingSpec encoder_outputs[] = {
+        {
+            .width = ENCODER_OUTPUT_WIDTH,
+            .thresholds = encoder_thresholds,
+            .accumulator_start = NMC_AUTO_ACCUMULATOR_OFFSET,
+            .inputs = encoder_output_inputs,
+            .input_count = ARRAY_COUNT(encoder_output_inputs),
+            .successors = encoder_successors,
+            .successor_count = ARRAY_COUNT(encoder_successors),
+        },
+    };
+    const NmcCoreMappingSpec encoder_mapping = {
+        .input_groups = encoder_inputs,
+        .input_group_count = ARRAY_COUNT(encoder_inputs),
+        .output_groups = encoder_outputs,
+        .output_group_count = ARRAY_COUNT(encoder_outputs),
+    };
+    CHECK(nmc_core_configure_mapping(&encoder_core, ENCODER_CORE_ID, &encoder_mapping));
     const NmcInputTile sparse_32_bit_tile = {
         .width = ENCODER_INPUT_WIDTH,
         .group_index = ENCODER_INPUT,
@@ -657,6 +655,123 @@ int main(void)
     CHECK(drain_acks(&encoder_core) == 0u);
 
     begin_step("event encoder test bench passed");
+
+    begin_step("graph mapper: generate core-local LUT indices from logical groups");
+    enum {
+        MAPPER_EXTERNAL_IMAGE = 0,
+        MAPPER_EXTERNAL_BIAS = 1,
+        MAPPER_SOURCE_GROUP = 100,
+        MAPPER_MIDDLE_GROUP = 101,
+        MAPPER_OBSERVER_GROUP = 102,
+        MAPPER_SIDE_GROUP = 103,
+        MAPPER_SOURCE_CORE = 30,
+        MAPPER_MIDDLE_CORE = 31,
+        MAPPER_OBSERVER_CORE = 32,
+        MAPPER_WIDTH = 8,
+    };
+    const int32_t mapper_thresholds[] = {1, 1, 1, 1, 1, 1, 1, 1};
+    int16_t mapper_external_weights[MAPPER_WIDTH * MAPPER_WIDTH];
+    int16_t mapper_external_side_weights[MAPPER_WIDTH * MAPPER_WIDTH];
+    int16_t mapper_external_observer_weights[MAPPER_WIDTH * MAPPER_WIDTH];
+    int16_t mapper_source_middle_weights[MAPPER_WIDTH * MAPPER_WIDTH];
+    int16_t mapper_source_observer_weights[MAPPER_WIDTH * MAPPER_WIDTH];
+    int16_t mapper_middle_observer_weights[MAPPER_WIDTH * MAPPER_WIDTH];
+    fill_weights(mapper_external_weights, ARRAY_COUNT(mapper_external_weights));
+    fill_weights(mapper_external_side_weights, ARRAY_COUNT(mapper_external_side_weights));
+    fill_weights(mapper_external_observer_weights, ARRAY_COUNT(mapper_external_observer_weights));
+    fill_weights(mapper_source_middle_weights, ARRAY_COUNT(mapper_source_middle_weights));
+    fill_weights(mapper_source_observer_weights, ARRAY_COUNT(mapper_source_observer_weights));
+    fill_weights(mapper_middle_observer_weights, ARRAY_COUNT(mapper_middle_observer_weights));
+
+    const NmcNetworkGroupMappingSpec mapper_groups[] = {
+        {.group_id = MAPPER_SOURCE_GROUP, .core_id = MAPPER_SOURCE_CORE, .width = MAPPER_WIDTH, .thresholds = mapper_thresholds},
+        {.group_id = MAPPER_SIDE_GROUP, .core_id = MAPPER_SOURCE_CORE, .width = MAPPER_WIDTH, .thresholds = mapper_thresholds},
+        {.group_id = MAPPER_MIDDLE_GROUP, .core_id = MAPPER_MIDDLE_CORE, .width = MAPPER_WIDTH, .thresholds = mapper_thresholds},
+        {.group_id = MAPPER_OBSERVER_GROUP, .core_id = MAPPER_OBSERVER_CORE, .width = MAPPER_WIDTH, .thresholds = mapper_thresholds},
+    };
+    const NmcNetworkInputMappingSpec mapper_inputs[] = {
+        {.input_id = MAPPER_EXTERNAL_IMAGE, .destination_group = MAPPER_SOURCE_GROUP, .width = MAPPER_WIDTH, .weights = mapper_external_weights},
+        {.input_id = MAPPER_EXTERNAL_IMAGE, .destination_group = MAPPER_SIDE_GROUP, .width = MAPPER_WIDTH, .weights = mapper_external_side_weights},
+        {.input_id = MAPPER_EXTERNAL_BIAS, .destination_group = MAPPER_OBSERVER_GROUP, .width = MAPPER_WIDTH, .weights = mapper_external_observer_weights},
+    };
+    const NmcNetworkConnectionMappingSpec mapper_connections[] = {
+        {.source_group = MAPPER_SOURCE_GROUP, .destination_group = MAPPER_MIDDLE_GROUP, .weights = mapper_source_middle_weights},
+        {.source_group = MAPPER_SOURCE_GROUP, .destination_group = MAPPER_OBSERVER_GROUP, .weights = mapper_source_observer_weights},
+        {.source_group = MAPPER_MIDDLE_GROUP, .destination_group = MAPPER_OBSERVER_GROUP, .weights = mapper_middle_observer_weights},
+    };
+    const NmcNetworkMappingSpec mapper_network = {
+        .groups = mapper_groups,
+        .group_count = ARRAY_COUNT(mapper_groups),
+        .inputs = mapper_inputs,
+        .input_count = ARRAY_COUNT(mapper_inputs),
+        .connections = mapper_connections,
+        .connection_count = ARRAY_COUNT(mapper_connections),
+    };
+    NmcGeneratedMappings generated_mappings;
+    CHECK(nmc_generate_core_mappings(&mapper_network, &generated_mappings));
+    const NmcGeneratedCoreMapping *generated_source = nmc_generated_mappings_find_core(&generated_mappings, MAPPER_SOURCE_CORE);
+    const NmcGeneratedCoreMapping *generated_middle = nmc_generated_mappings_find_core(&generated_mappings, MAPPER_MIDDLE_CORE);
+    const NmcGeneratedCoreMapping *generated_observer = nmc_generated_mappings_find_core(&generated_mappings, MAPPER_OBSERVER_CORE);
+    CHECK(generated_source != NULL);
+    CHECK(generated_middle != NULL);
+    CHECK(generated_observer != NULL);
+    CHECK(generated_source->mapping.input_group_count == 1u);
+    CHECK(generated_source->mapping.output_group_count == 2u);
+    CHECK(generated_source->input_is_external[0]);
+    CHECK(generated_source->input_external_ids[0] == MAPPER_EXTERNAL_IMAGE);
+    CHECK(generated_source->mapping.output_groups[0].successor_count == 2u);
+    CHECK(generated_source->mapping.output_groups[0].successors[0].core_id == MAPPER_MIDDLE_CORE);
+    CHECK(generated_source->mapping.output_groups[0].successors[0].input_group == 0u);
+    CHECK(generated_source->mapping.output_groups[0].successors[1].core_id == MAPPER_OBSERVER_CORE);
+    CHECK(generated_source->mapping.output_groups[0].successors[1].input_group == 1u);
+    CHECK(generated_source->mapping.output_groups[1].input_count == 1u);
+    CHECK(generated_source->mapping.output_groups[1].inputs[0].input_group == 0u);
+    CHECK(generated_middle->mapping.input_group_count == 1u);
+    CHECK(generated_observer->mapping.input_group_count == 3u);
+    CHECK(generated_middle->mapping.output_groups[0].predecessor_count == 1u);
+    CHECK(generated_middle->mapping.output_groups[0].predecessors[0].core_id == MAPPER_SOURCE_CORE);
+    CHECK(generated_middle->mapping.output_groups[0].predecessors[0].ack_group == 0u);
+
+    NmcCore mapper_source_core;
+    NmcCore mapper_middle_core;
+    NmcCore mapper_observer_core;
+    CHECK(nmc_core_configure_mapping(&mapper_source_core, generated_source->core_id, &generated_source->mapping));
+    CHECK(nmc_core_configure_mapping(&mapper_middle_core, generated_middle->core_id, &generated_middle->mapping));
+    CHECK(nmc_core_configure_mapping(&mapper_observer_core, generated_observer->core_id, &generated_observer->mapping));
+
+    const NmcInputTile mapper_input = {.width = MAPPER_WIDTH, .group_index = 0u, .payload = {0x03u}};
+    NmcNetworkTile mapper_tile;
+    NmcInputTile mapper_middle_input;
+    NmcAckMessage mapper_ack;
+    print_input_tile(&mapper_input);
+    CHECK(nmc_core_process_input_tile(&mapper_source_core, &mapper_input));
+    CHECK(nmc_core_pop_output_tile(&mapper_source_core, &mapper_tile));
+    CHECK(mapper_tile.destination_count == 2u);
+    size_t mapper_middle_destination = NMC_INVALID_INDEX;
+    bool mapper_found_observer_destination = false;
+    for (size_t i = 0u; i < mapper_tile.destination_count; ++i) {
+        if (mapper_tile.destinations[i].core_id == MAPPER_MIDDLE_CORE && mapper_tile.destinations[i].group_index == 0u) {
+            mapper_middle_destination = i;
+        }
+        if (mapper_tile.destinations[i].core_id == MAPPER_OBSERVER_CORE && mapper_tile.destinations[i].group_index == 1u) {
+            mapper_found_observer_destination = true;
+        }
+    }
+    CHECK(mapper_middle_destination != NMC_INVALID_INDEX);
+    CHECK(mapper_found_observer_destination);
+    CHECK(nmc_network_tile_get_input_tile(&mapper_tile, mapper_middle_destination, &mapper_middle_input));
+    CHECK(nmc_core_process_input_tile(&mapper_middle_core, &mapper_middle_input));
+    CHECK(nmc_core_pop_output_tile(&mapper_middle_core, &mapper_tile));
+    CHECK(mapper_tile.destination_count == 1u);
+    CHECK(mapper_tile.destinations[0].core_id == MAPPER_OBSERVER_CORE);
+    CHECK(mapper_tile.destinations[0].group_index == 2u);
+    CHECK(nmc_core_pop_ack(&mapper_middle_core, &mapper_ack));
+    CHECK(mapper_ack.destination_count == 1u);
+    CHECK(mapper_ack.destinations[0].core_id == MAPPER_SOURCE_CORE);
+    CHECK(mapper_ack.destinations[0].group_index == 0u);
+    CHECK(nmc_core_process_ack(&mapper_source_core, &mapper_ack));
+
+    begin_step("graph mapper test bench passed");
 
     begin_step("standalone router: XY multicast splits by next-hop direction");
     NmcRouter xy_router;
@@ -703,9 +818,9 @@ int main(void)
         MULTI_SOURCE_CORE = 10,
         MULTI_CONSUMER_CORE = 11,
         MULTI_OBSERVER_CORE = 12,
-        MULTI_INPUT = 0,
-        MULTI_ACK_FROM_CONSUMER = 0,
         MULTI_OUTPUT = 0,
+        MULTI_INPUT = 0,
+        MULTI_ACK_FROM_FIRST_SUCCESSOR = 0,
         MULTI_WIDTH = 8,
     };
 
@@ -714,7 +829,7 @@ int main(void)
         {.core_id = MULTI_CONSUMER_CORE, .coordinate = {.x = 1, .y = 1}},
         {.core_id = MULTI_OBSERVER_CORE, .coordinate = {.x = 1, .y = 0}},
     };
-    const size_t mesh_map_count = sizeof(mesh_map) / sizeof(mesh_map[0]);
+    const size_t mesh_map_count = ARRAY_COUNT(mesh_map);
 
     NmcRouter router_00;
     NmcRouter router_10;
@@ -726,49 +841,90 @@ int main(void)
     nmc_router_init(&router_11, MULTI_CONSUMER_CORE, (NmcMeshCoordinate){.x = 1, .y = 1}, NMC_ROUTER_XY);
 
     const int32_t multi_thresholds[] = {1, 1, 1, 1, 1, 1, 1, 1};
+    int16_t multi_weights[MULTI_WIDTH * MULTI_WIDTH];
+    fill_weights(multi_weights, ARRAY_COUNT(multi_weights));
 
-    NmcCore source_core;
-    nmc_core_init(&source_core, MULTI_SOURCE_CORE);
-    fill_weights(source_core.weights, NMC_WEIGHT_MEMORY_SIZE);
-    CHECK(nmc_core_add_input_group(&source_core));
-    CHECK(nmc_core_add_ack_group(&source_core));
-    CHECK(nmc_core_add_output_group(&source_core, MULTI_WIDTH, multi_thresholds));
-    CHECK(nmc_core_set_output_accumulator_lut_start(&source_core, MULTI_OUTPUT, 0));
-    CHECK(nmc_core_add_output_successor_lut_entry(&source_core, MULTI_CONSUMER_CORE, MULTI_INPUT));
-    CHECK(nmc_core_set_output_lut_starts(&source_core, MULTI_OUTPUT, 0, 1));
-    CHECK(nmc_core_set_output_lut_starts(&source_core, 1, 1, 1));
-    CHECK(nmc_core_add_ack_output_pair_lut_entry(&source_core, MULTI_OUTPUT));
-    CHECK(nmc_core_set_ack_lut_start(&source_core, MULTI_ACK_FROM_CONSUMER, 0));
-    CHECK(nmc_core_set_ack_lut_start(&source_core, 1, 1));
-    CHECK(nmc_core_add_input_output_pair_lut_entry(&source_core, MULTI_OUTPUT, 0));
-    CHECK(nmc_core_set_input_lut_start(&source_core, MULTI_INPUT, 0));
-    CHECK(nmc_core_set_input_lut_start(&source_core, 1, 1));
-
-    NmcCore consumer_core;
-    nmc_core_init(&consumer_core, MULTI_CONSUMER_CORE);
-    fill_weights(consumer_core.weights, NMC_WEIGHT_MEMORY_SIZE);
-    CHECK(nmc_core_add_input_group(&consumer_core));
-    CHECK(nmc_core_add_output_group(&consumer_core, MULTI_WIDTH, multi_thresholds));
-    CHECK(nmc_core_set_output_accumulator_lut_start(&consumer_core, MULTI_OUTPUT, 0));
-    CHECK(nmc_core_add_output_successor_lut_entry(&consumer_core, MULTI_OBSERVER_CORE, MULTI_INPUT));
-    CHECK(nmc_core_add_output_predecessor_lut_entry(&consumer_core, MULTI_SOURCE_CORE, MULTI_ACK_FROM_CONSUMER));
-    CHECK(nmc_core_set_output_lut_starts(&consumer_core, MULTI_OUTPUT, 0, 1));
-    CHECK(nmc_core_set_output_lut_starts(&consumer_core, 1, 2, 2));
-    CHECK(nmc_core_add_input_output_pair_lut_entry(&consumer_core, MULTI_OUTPUT, 0));
-    CHECK(nmc_core_set_input_lut_start(&consumer_core, MULTI_INPUT, 0));
-    CHECK(nmc_core_set_input_lut_start(&consumer_core, 1, 1));
+    const NmcInputGroupMappingSpec multi_inputs[] = {
+        [MULTI_INPUT] = NMC_INPUT_GROUP(MULTI_WIDTH),
+    };
 
     NmcCore observer_core;
-    nmc_core_init(&observer_core, MULTI_OBSERVER_CORE);
-    fill_weights(observer_core.weights, NMC_WEIGHT_MEMORY_SIZE);
-    CHECK(nmc_core_add_input_group(&observer_core));
-    CHECK(nmc_core_add_output_group(&observer_core, MULTI_WIDTH, multi_thresholds));
-    CHECK(nmc_core_set_output_accumulator_lut_start(&observer_core, MULTI_OUTPUT, 0));
-    CHECK(nmc_core_set_output_lut_starts(&observer_core, MULTI_OUTPUT, 0, 0));
-    CHECK(nmc_core_set_output_lut_starts(&observer_core, 1, 0, 0));
-    CHECK(nmc_core_add_input_output_pair_lut_entry(&observer_core, MULTI_OUTPUT, 0));
-    CHECK(nmc_core_set_input_lut_start(&observer_core, MULTI_INPUT, 0));
-    CHECK(nmc_core_set_input_lut_start(&observer_core, 1, 1));
+    const NmcInputConnectionMappingSpec observer_output_inputs[] = {
+        NMC_INPUT_CONNECTION(MULTI_INPUT, multi_weights),
+    };
+    const NmcOutputGroupMappingSpec observer_outputs[] = {
+        {
+            .width = MULTI_WIDTH,
+            .thresholds = multi_thresholds,
+            .accumulator_start = NMC_AUTO_ACCUMULATOR_OFFSET,
+            .inputs = observer_output_inputs,
+            .input_count = ARRAY_COUNT(observer_output_inputs),
+        },
+    };
+    const NmcCoreMappingSpec observer_mapping = {
+        .input_groups = multi_inputs,
+        .input_group_count = ARRAY_COUNT(multi_inputs),
+        .output_groups = observer_outputs,
+        .output_group_count = ARRAY_COUNT(observer_outputs),
+    };
+    CHECK(nmc_core_configure_mapping(&observer_core, MULTI_OBSERVER_CORE, &observer_mapping));
+
+    NmcCore consumer_core;
+    const NmcInputConnectionMappingSpec consumer_output_inputs[] = {
+        NMC_INPUT_CONNECTION(MULTI_INPUT, multi_weights),
+    };
+    const NmcOutputSuccessorMappingSpec consumer_successors[] = {
+        NMC_SUCCESSOR(MULTI_OBSERVER_CORE, MULTI_INPUT),
+    };
+    const NmcPredecessorMappingSpec consumer_predecessors[] = {
+        NMC_PREDECESSOR(MULTI_SOURCE_CORE, MULTI_ACK_FROM_FIRST_SUCCESSOR),
+    };
+    const NmcOutputGroupMappingSpec consumer_outputs[] = {
+        {
+            .width = MULTI_WIDTH,
+            .thresholds = multi_thresholds,
+            .accumulator_start = NMC_AUTO_ACCUMULATOR_OFFSET,
+            .inputs = consumer_output_inputs,
+            .input_count = ARRAY_COUNT(consumer_output_inputs),
+            .successors = consumer_successors,
+            .successor_count = ARRAY_COUNT(consumer_successors),
+            .predecessors = consumer_predecessors,
+            .predecessor_count = ARRAY_COUNT(consumer_predecessors),
+        },
+    };
+    const NmcCoreMappingSpec consumer_mapping = {
+        .input_groups = multi_inputs,
+        .input_group_count = ARRAY_COUNT(multi_inputs),
+        .output_groups = consumer_outputs,
+        .output_group_count = ARRAY_COUNT(consumer_outputs),
+    };
+    CHECK(nmc_core_configure_mapping(&consumer_core, MULTI_CONSUMER_CORE, &consumer_mapping));
+
+    NmcCore source_core;
+    const NmcInputConnectionMappingSpec source_output_inputs[] = {
+        NMC_INPUT_CONNECTION(MULTI_INPUT, multi_weights),
+    };
+    const NmcOutputSuccessorMappingSpec source_successors[] = {
+        NMC_SUCCESSOR(MULTI_CONSUMER_CORE, MULTI_INPUT),
+    };
+    const NmcOutputGroupMappingSpec source_outputs[] = {
+        {
+            .width = MULTI_WIDTH,
+            .thresholds = multi_thresholds,
+            .accumulator_start = NMC_AUTO_ACCUMULATOR_OFFSET,
+            .inputs = source_output_inputs,
+            .input_count = ARRAY_COUNT(source_output_inputs),
+            .successors = source_successors,
+            .successor_count = ARRAY_COUNT(source_successors),
+        },
+    };
+    const NmcCoreMappingSpec source_mapping = {
+        .input_groups = multi_inputs,
+        .input_group_count = ARRAY_COUNT(multi_inputs),
+        .output_groups = source_outputs,
+        .output_group_count = ARRAY_COUNT(source_outputs),
+    };
+    CHECK(nmc_core_configure_mapping(&source_core, MULTI_SOURCE_CORE, &source_mapping));
 
     const NmcRouterMessage side_input_step0 = {
         .destination_count = 1u,

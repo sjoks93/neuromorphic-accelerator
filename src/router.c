@@ -1,4 +1,4 @@
-#include "neuromorphic_router.h"
+#include "nmc/router.h"
 
 #include <string.h>
 

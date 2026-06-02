@@ -1,5 +1,5 @@
-#ifndef NEUROMORPHIC_CORE_H
-#define NEUROMORPHIC_CORE_H
+#ifndef NMC_CORE_H
+#define NMC_CORE_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -21,6 +21,10 @@
 #define NMC_MAX_INPUT_OUTPUT_PAIR_LUT_ENTRIES 64u
 #define NMC_MAX_ACK_OUTPUT_PAIR_LUT_ENTRIES 64u
 #define NMC_MAX_OUTPUT_ROUTE_LUT_ENTRIES 64u
+#define NMC_MAX_MAPPED_CORES 16u
+#define NMC_MAX_NETWORK_GROUPS 32u
+#define NMC_MAX_NETWORK_CONNECTIONS 64u
+#define NMC_MAX_NETWORK_INPUTS 32u
 #define NMC_MAX_TILE_DESTINATIONS 8u
 #define NMC_MAX_OUTPUT_QUEUE 64u
 #define NMC_MAX_ACK_QUEUE 64u
@@ -30,8 +34,16 @@
 #define NMC_WEIGHT_MEMORY_SIZE 1024u
 #define NMC_ACCUMULATOR_MEMORY_SIZE 1024u
 #define NMC_INVALID_INDEX UINT32_MAX
+#define NMC_AUTO_WEIGHT_OFFSET SIZE_MAX
+#define NMC_AUTO_ACCUMULATOR_OFFSET SIZE_MAX
+#define NMC_INPUT_GROUP(width_) ((NmcInputGroupMappingSpec){.width = (width_)})
+#define NMC_INPUT_CONNECTION(input_group_, weights_) ((NmcInputConnectionMappingSpec){.input_group = (input_group_), .weight_offset = NMC_AUTO_WEIGHT_OFFSET, .weights = (weights_)})
+#define NMC_SUCCESSOR(core_id_, input_group_) ((NmcOutputSuccessorMappingSpec){.core_id = (core_id_), .input_group = (input_group_)})
+#define NMC_PREDECESSOR(core_id_, ack_group_) ((NmcPredecessorMappingSpec){.core_id = (core_id_), .ack_group = (ack_group_)})
 
 typedef uint32_t nmc_core_id_t;
+typedef uint32_t nmc_network_group_id_t;
+typedef uint32_t nmc_external_input_id_t;
 typedef uint32_t nmc_input_index_t;
 typedef uint32_t nmc_ack_index_t;
 typedef uint32_t nmc_output_index_t;
@@ -141,6 +153,106 @@ typedef struct {
     uint8_t payload[NMC_MAX_GROUP_BYTES];
 } NmcNetworkTile;
 
+/* High-level declaration of one local input group. */
+typedef struct {
+    nmc_tile_width_t width;
+} NmcInputGroupMappingSpec;
+
+/* High-level declaration of one input edge feeding an output group. */
+typedef struct {
+    nmc_input_index_t input_group;
+    size_t weight_offset;
+    const int16_t *weights;
+} NmcInputConnectionMappingSpec;
+
+/* High-level declaration of one successor edge driven by an output group. */
+typedef struct {
+    nmc_core_id_t core_id;
+    nmc_input_index_t input_group;
+} NmcOutputSuccessorMappingSpec;
+
+/* High-level declaration of one predecessor edge that receives ACKs from an output group. */
+typedef struct {
+    nmc_core_id_t core_id;
+    nmc_ack_index_t ack_group;
+} NmcPredecessorMappingSpec;
+
+/* High-level output group mapping specification. */
+typedef struct {
+    nmc_tile_width_t width;
+    const int32_t *thresholds;
+    size_t accumulator_start;
+    const NmcInputConnectionMappingSpec *inputs;
+    size_t input_count;
+    const NmcOutputSuccessorMappingSpec *successors;
+    size_t successor_count;
+    const NmcPredecessorMappingSpec *predecessors;
+    size_t predecessor_count;
+} NmcOutputGroupMappingSpec;
+
+/* Complete high-level mapping specification for one core. */
+typedef struct {
+    const NmcInputGroupMappingSpec *input_groups;
+    size_t input_group_count;
+    const NmcOutputGroupMappingSpec *output_groups;
+    size_t output_group_count;
+} NmcCoreMappingSpec;
+
+/* Graph-level declaration of one logical neural group placed on one core. */
+typedef struct {
+    nmc_network_group_id_t group_id;
+    nmc_core_id_t core_id;
+    nmc_tile_width_t width;
+    const int32_t *thresholds;
+} NmcNetworkGroupMappingSpec;
+
+/* Graph-level declaration of one side/input-interface edge into a logical group. */
+typedef struct {
+    nmc_external_input_id_t input_id;
+    nmc_network_group_id_t destination_group;
+    nmc_tile_width_t width;
+    const int16_t *weights;
+} NmcNetworkInputMappingSpec;
+
+/* Graph-level declaration of one logical group-to-group edge. */
+typedef struct {
+    nmc_network_group_id_t source_group;
+    nmc_network_group_id_t destination_group;
+    const int16_t *weights;
+} NmcNetworkConnectionMappingSpec;
+
+/* Minimal graph-level mapping: logical groups, optional external inputs, and connections. */
+typedef struct {
+    const NmcNetworkGroupMappingSpec *groups;
+    size_t group_count;
+    const NmcNetworkInputMappingSpec *inputs;
+    size_t input_count;
+    const NmcNetworkConnectionMappingSpec *connections;
+    size_t connection_count;
+} NmcNetworkMappingSpec;
+
+/* Generated, owned storage for one core-local mapping. */
+typedef struct {
+    nmc_core_id_t core_id;
+    NmcCoreMappingSpec mapping;
+    NmcInputGroupMappingSpec input_groups[NMC_MAX_INPUT_GROUPS];
+    NmcOutputGroupMappingSpec output_groups[NMC_MAX_OUTPUT_GROUPS];
+    NmcInputConnectionMappingSpec output_inputs[NMC_MAX_OUTPUT_GROUPS][NMC_MAX_INPUT_GROUPS];
+    NmcOutputSuccessorMappingSpec output_successors[NMC_MAX_OUTPUT_GROUPS][NMC_MAX_OUTPUT_ROUTE_LUT_ENTRIES];
+    NmcPredecessorMappingSpec output_predecessors[NMC_MAX_OUTPUT_GROUPS][NMC_MAX_OUTPUT_ROUTE_LUT_ENTRIES];
+    nmc_network_group_id_t output_group_ids[NMC_MAX_OUTPUT_GROUPS];
+    bool input_is_external[NMC_MAX_INPUT_GROUPS];
+    nmc_external_input_id_t input_external_ids[NMC_MAX_INPUT_GROUPS];
+    nmc_network_group_id_t input_source_group_ids[NMC_MAX_INPUT_GROUPS];
+    nmc_network_group_id_t input_destination_group_ids[NMC_MAX_INPUT_GROUPS];
+} NmcGeneratedCoreMapping;
+
+/* Generated mappings for every core used by a graph-level mapping. */
+typedef struct {
+    size_t core_count;
+    NmcGeneratedCoreMapping cores[NMC_MAX_MAPPED_CORES];
+} NmcGeneratedMappings;
+
 /* Complete simulator state for one core instance. */
 typedef struct {
     nmc_core_id_t core_id;
@@ -211,6 +323,14 @@ bool nmc_core_add_input_output_pair_lut_entry(NmcCore *core,
                                               size_t weight_offset);
 bool nmc_core_add_ack_output_pair_lut_entry(NmcCore *core,
                                             nmc_output_index_t output_index);
+bool nmc_core_configure_mapping(NmcCore *core, nmc_core_id_t core_id, const NmcCoreMappingSpec *mapping);
+bool nmc_core_mapping_ack_group_for_successor(const NmcCoreMappingSpec *mapping,
+                                              nmc_core_id_t successor_core_id,
+                                              nmc_input_index_t successor_input_group,
+                                              nmc_ack_index_t *ack_group);
+bool nmc_generate_core_mappings(const NmcNetworkMappingSpec *network, NmcGeneratedMappings *generated);
+const NmcGeneratedCoreMapping *nmc_generated_mappings_find_core(const NmcGeneratedMappings *generated,
+                                                                nmc_core_id_t core_id);
 bool nmc_core_process_input_tile(NmcCore *core, const NmcInputTile *tile);
 bool nmc_core_pop_output_tile(NmcCore *core, NmcNetworkTile *tile);
 bool nmc_core_process_ack(NmcCore *core, const NmcAckMessage *ack);
