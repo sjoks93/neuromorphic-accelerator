@@ -1,0 +1,273 @@
+\documentclass[10pt,conference]{IEEEtran}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\newcommand{\arch}{GEM-NMC}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+
+\title{A Group-Event Memory Neuromorphic Core Simulator for Analytical Memory, Latency, and Energy Evaluation}
+
+\author{%
+\IEEEauthorblockN{Author Name(s)}
+\IEEEauthorblockA{Affiliation\\
+Email}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This paper presents \arch{}, a cycle-accounted C simulator for a tiled digital neuromorphic accelerator architecture that combines grouped bitmap communication, sparse event extraction, SRAM-resident mapping tables, unified weight/state memory, routed multicast traffic, ACK-based flow control, and a programmable spike-only activation vector ALU. The simulator is designed to evaluate architectural tradeoffs before RTL implementation. We develop an analytical comparison between \arch{} and a vanilla neuromorphic baseline that uses fixed-size crossbar-style blocks, address-event representation (AER) packets, partitioned weight/state memories, and fixed threshold activation. The proposed analysis models memory utilization, memory accesses, communication metadata, latency, and energy as functions of graph sparsity, group size, fan-in, fan-out, spike activity, and neuron-state requirements. The simulator exposes these quantities through explicit SRAM tables and counters, enabling reproducible evaluation across feed-forward and recurrent spiking neural networks. Preliminary draft results are expressed as formulas and an experimental plan; measured values will be filled in from benchmark networks in the final version.
+\end{abstract}
+
+\begin{IEEEkeywords}
+neuromorphic computing, spiking neural networks, architecture simulation, memory utilization, sparse event processing, vector activation, analytical modeling
+\end{IEEEkeywords}
+
+\section{Introduction}
+Spiking neural networks (SNNs) offer event-driven computation, sparse communication, and local state updates, but practical neuromorphic accelerators are often limited by memory fragmentation, communication metadata overhead, irregular fan-in/fan-out, and synchronization complexity. Many digital neuromorphic systems organize computation around fixed crossbars or fixed neuron blocks. This simplifies local control but can waste storage when layer widths, connectivity, or neuron-state requirements do not match the physical block shape. Similarly, one-spike-per-packet address-event communication can spend more energy on metadata and routing than on useful spike payloads when many spikes originate from the same logical group.
+
+This work studies a group-event memory architecture, \arch{}, through a dependency-free C11 simulator. The architecture departs from a vanilla core in four ways. First, logical source and destination populations are mapped through compact two-stage lookup tables (LUTs) rather than through dense crossbar slots. Second, weights, packed accumulators, and optional activation state share a unified SRAM address space, reducing hard partition waste. Third, spikes are transported as bit-packed group tiles and decoded into sparse input events at the destination core. Fourth, output activation is implemented by a bounded programmable vector ALU (v-ALU), allowing multiple spike-only neuron models without replacing the datapath.
+
+The goal of this paper is not to report a completed silicon implementation. Instead, it defines the simulator and uses it as an analytical framework to compare \arch{} against a vanilla neuromorphic architecture. The final paper will answer the following questions:
+\begin{itemize}
+    \item How much SRAM capacity is used by useful weights, accumulators, state, mapping metadata, and route metadata?
+    \item How many SRAM reads/writes and network bytes are required per natural SNN step?
+    \item Under which activity and sparsity regimes do grouped bitmaps outperform one-event AER packets?
+    \item How do ACK-based local ordering and programmable activation affect latency and energy?
+\end{itemize}
+
+\section{Contributions}
+This draft makes the following contributions:
+\begin{enumerate}
+    \item It describes a hardware-oriented simulator for grouped, sparse, tiled neuromorphic computation.
+    \item It defines a vanilla neuromorphic baseline suitable for analytical comparison.
+    \item It derives parameterized formulas for memory utilization, memory accesses, latency, and energy.
+    \item It outlines a benchmark methodology for feed-forward and recurrent SNN workloads.
+\end{enumerate}
+
+\section{Architecture Overview}
+\subsection{Core Organization}
+Each simulated tile contains one neuromorphic core and one mesh router. A core consumes local input tiles, performs sparse weighted accumulation into output-group accumulators, activates ready output groups, and emits router-facing spike tiles and ACK messages. Hardware-like arrays are modeled explicitly: input-group tables, input/output pair LUTs, ACK tables, output-group tables, route LUTs, accumulator base LUTs, unified SRAM, activation instruction memory, and bounded output queues.
+
+The core uses start-plus-terminal LUT ranges. For a group index $g$, the second-stage range is
+\begin{equation}
+    [s_g, e_g) = [\mathrm{start}[g], \mathrm{start}[g+1]).
+\end{equation}
+This representation stores one start pointer per group plus one terminal sentinel and avoids per-entry dynamic allocation metadata.
+
+\subsection{Grouped Sparse Input Path}
+An input tile contains a local input-group index, a group width $N$, and a bit-packed payload. The input-group table selects all connected output groups. For each input/output pair, the payload is converted into sparse event indices. An event index selects an input-bank-major weight row:
+\begin{equation}
+    a_w(i,j) = a_0 + iM + j,
+\end{equation}
+where $i$ is the active input event, $j$ is the output neuron, $M$ is the output-group width, and $a_0$ is the mapped weight offset. This row layout allows one sparse input event to address an output-wide slice.
+
+\subsection{Unified Memory}
+The unified SRAM stores signed 16-bit lanes. Weight matrices are stored input-bank-major, while user-facing kernels may remain output-major and are transposed by the mapper. Accumulators use packed multi-lane values. If a membrane value uses $P$ 16-bit lanes, the accumulator storage for an output group of width $M$ is
+\begin{equation}
+    S_{acc}(M) = PM \quad \text{lanes}.
+\end{equation}
+Optional activation state, such as refractory counters or heterogeneous thresholds, is allocated only when the selected activation program requires it.
+
+\subsection{Programmable Activation v-ALU}
+When an output group has received all required inputs and successor ACK credit is available, its activation program executes over the accumulator slice. The default program is integrate-and-fire: load accumulator, compare against a threshold immediate, emit predicate bits, and reset or update the accumulator. More complex spike-only programs can use unified-SRAM state ranges and fixed-point arithmetic. Activation remains bounded: no arbitrary host callbacks, unbounded loops, or dynamic memory accesses are permitted.
+
+\subsection{Mesh Routing and ACK Flow Control}
+Output spike tiles carry one bitmap payload and a destination list. The router performs deterministic dimension-order routing and splits multicast traffic by next-hop port. ACK messages return credit through ACK LUTs. This creates local one-in-flight natural-step ordering without global timestep tags. Feed-forward ACKs are emitted after destination activation, while recurrent ACKs may be emitted at input-window completion to avoid cyclic deadlock.
+
+\section{Vanilla Baseline}
+We compare \arch{} against a baseline digital neuromorphic core with the following properties:
+\begin{itemize}
+    \item Fixed physical blocks of $B_{in}$ input lines and $B_{out}$ output neurons.
+    \item Dense or block-dense crossbar allocation per mapped connection.
+    \item Separate SRAM partitions for weights, membrane state, thresholds, and routing tables.
+    \item One AER-like packet per spike, with source or destination address metadata.
+    \item Fixed threshold activation logic.
+    \item Credit or barrier synchronization modeled as a per-edge or per-layer cost.
+\end{itemize}
+This baseline is intentionally generic. The final paper will instantiate parameters from representative published neuromorphic systems or from an RTL reference core.
+
+\section{Analytical Model}
+\subsection{Notation}
+Let $\mathcal{G}$ be the set of logical groups, $\mathcal{E}$ the set of directed group-to-group edges, $N_e$ the source width of edge $e$, $M_e$ the destination width, $F_g^+$ the fan-out of group $g$, $F_g^-$ the fan-in of group $g$, $\rho_g$ the spike probability or measured activity of group $g$, $w$ the weight word size in bits, $p$ the accumulator lane multiplier, and $b_{addr}$ the metadata bits in one AER packet.
+
+\subsection{Memory Capacity}
+For \arch{}, useful weight storage is allocated only for realized edges:
+\begin{equation}
+    C_{W}^{\arch} = \sum_{e\in\mathcal{E}} N_e M_e w.
+\end{equation}
+Accumulator storage is allocated per output group:
+\begin{equation}
+    C_{A}^{\arch} = \sum_{g\in\mathcal{G}_{out}} M_g p w.
+\end{equation}
+Optional activation state storage is
+\begin{equation}
+    C_{S}^{\arch} = \sum_{g\in\mathcal{G}_{out}} \sum_{r\in\mathcal{R}_g} M_g q_r,
+\end{equation}
+where $\mathcal{R}_g$ is the set of required per-neuron state/parameter ranges and $q_r$ is the bit width of range $r$.
+
+Mapping metadata includes first-stage starts and second-stage entries:
+\begin{equation}
+    C_{LUT}^{\arch} = (|\mathcal{G}_{in}|+1)b_s + |\mathcal{E}|b_{pair} + (|\mathcal{G}_{out}|+1)b_r + |\mathcal{R}_{route}|b_{dest} + C_{ack}.
+\end{equation}
+The total modeled SRAM capacity is therefore
+\begin{equation}
+    C_{tot}^{\arch}=C_W^{\arch}+C_A^{\arch}+C_S^{\arch}+C_{LUT}^{\arch}+C_{prog}.
+\end{equation}
+
+For a fixed-block vanilla baseline, an edge with dimensions $(N_e,M_e)$ consumes
+\begin{equation}
+    C_{W,e}^{base}=\left\lceil\frac{N_e}{B_{in}}\right\rceil\left\lceil\frac{M_e}{B_{out}}\right\rceil B_{in}B_{out}w.
+\end{equation}
+The block fragmentation factor is
+\begin{equation}
+    \phi_e = \frac{C_{W,e}^{base}}{N_eM_ew}.
+\end{equation}
+Separate SRAM partitions add unused slack:
+\begin{equation}
+    C_{slack}^{base}=\sum_{k\in\{W,A,S,R\}}(C_{k,alloc}^{base}-C_{k,used}^{base}).
+\end{equation}
+Memory utilization is
+\begin{equation}
+    U = \frac{C_{useful}}{C_{allocated}}.
+\end{equation}
+
+\subsection{Communication Cost}
+For \arch{}, a group tile of width $N$ requires $N$ payload bits plus destination metadata amortized over all active spikes:
+\begin{equation}
+    B_{tile}^{\arch}(g)=N_g + F_g^+ b_{dest} + b_{hdr}.
+\end{equation}
+The expected metadata cost per spike is
+\begin{equation}
+    \eta^{\arch}(g)=\frac{F_g^+b_{dest}+b_{hdr}}{\rho_g N_g}.
+\end{equation}
+For AER packets, expected bits per group step are
+\begin{equation}
+    B_{AER}^{base}(g)=\rho_gN_g(b_{addr}+b_{hdr}^{base}).
+\end{equation}
+Grouped tiles are communication-efficient when
+\begin{equation}
+    N_g + F_g^+b_{dest}+b_{hdr} < \rho_gN_g(b_{addr}+b_{hdr}^{base}).
+\end{equation}
+This inequality defines an activity crossover point:
+\begin{equation}
+    \rho_g^* = \frac{N_g + F_g^+b_{dest}+b_{hdr}}{N_g(b_{addr}+b_{hdr}^{base})}.
+\end{equation}
+Below $\rho_g^*$, AER may transmit fewer bits; above it, bitmap grouping amortizes metadata.
+
+\subsection{Memory Accesses}
+Let $K_g=\rho_gN_g$ be the expected number of active input events in group $g$. For one edge $e:g\rightarrow h$, \arch{} reads approximately
+\begin{equation}
+    R_{W,e}^{\arch}=K_gM_h
+\end{equation}
+weight lanes and performs accumulator reads and writes proportional to active events and output width:
+\begin{equation}
+    R_{A,e}^{\arch}\approx K_gM_hp, \quad W_{A,e}^{\arch}\approx K_gM_hp.
+\end{equation}
+Activation adds
+\begin{equation}
+    R_{act,h}^{\arch}=M_hp + \sum_{r\in\mathcal{R}_h}M_h, \quad W_{act,h}^{\arch}=M_hp + \sum_{r\in\mathcal{W}_h}M_h,
+\end{equation}
+where $\mathcal{W}_h$ is the subset of activation state ranges written by the program.
+
+For a dense block baseline, if a block is evaluated whenever any input event arrives, a conservative access estimate is
+\begin{equation}
+    R_{W,e}^{base}=\mathbb{I}[K_g>0]\left\lceil\frac{N_e}{B_{in}}\right\rceil\left\lceil\frac{M_e}{B_{out}}\right\rceil B_{in}B_{out}.
+\end{equation}
+If the baseline also performs sparse row reads, $R_{W,e}^{base}$ should be replaced with its row-sparse implementation cost, allowing an apples-to-apples comparison.
+
+\subsection{Latency}
+The simulator reports encoder cycles, compute cycles, and activation cycles. A first-order model is
+\begin{equation}
+    T^{\arch}=T_{route}+T_{LUT}+T_{enc}+T_{comp}+T_{act}+T_{queue}+T_{ack}.
+\end{equation}
+With $P_{in}$ parallel encoder lanes and window size $W_{enc}$,
+\begin{equation}
+    T_{enc}\approx \max\left(\left\lceil\frac{K_g}{P_{in}}\right\rceil,\; T_{skip}(N_g,W_{enc},\rho_g)\right).
+\end{equation}
+With $P_{out}$ output lanes and $P_{red}$ reduction lanes,
+\begin{equation}
+    T_{comp}\approx K_g\left\lceil\frac{M_h}{P_{out}}\right\rceil T_{red}(P_{red}).
+\end{equation}
+Activation latency is bounded by the v-ALU instruction count $I_h$ and output width:
+\begin{equation}
+    T_{act}\approx I_h\left\lceil\frac{M_h}{P_{act}}\right\rceil + T_{emit}.
+\end{equation}
+
+\subsection{Energy}
+Energy is estimated from event counts and per-access costs:
+\begin{align}
+    E^{\arch} &= E_{SRAM}+E_{logic}+E_{router}+E_{ctrl},\\
+    E_{SRAM} &= n_{r,W}e_{r,W}+n_{r,A}e_{r,A}+n_{w,A}e_{w,A}+n_{r,S}e_{r,S}+n_{w,S}e_{w,S},\\
+    E_{router} &= n_{bit-hop}e_{bit-hop}+n_{flit}e_{flit-ctrl}.
+\end{align}
+The same accounting is applied to the baseline, replacing tile bit-hops with AER packet bit-hops and replacing unified-memory accesses with partitioned memory accesses. The final version will use either CACTI-derived SRAM costs, FPGA power estimates, or measured RTL switching activity.
+
+\section{Simulator Instrumentation}
+The simulator exposes counters for event count, encoder cycles, compute cycles, activation instruction count, activation cycles, output queue behavior, ACK behavior, and router splits. Because weights, accumulators, routes, and activation state are explicit arrays, memory capacity and memory traffic can be obtained without reverse-engineering opaque runtime data structures. Planned counter extensions include per-table read/write counts, per-router-port bit traffic, queue occupancy histograms, and activation SRAM range traffic.
+
+\section{Experimental Plan}
+\subsection{Benchmarks}
+The final paper will evaluate:
+\begin{itemize}
+    \item synthetic fan-in/fan-out sweeps with controlled sparsity;
+    \item layered SNN classifiers such as MNIST or Fashion-MNIST;
+    \item temporal recurrent workloads such as gesture or event-camera sequences;
+    \item reservoir-style recurrent networks with sparse feedback;
+    \item neuron-model variants: IF, LIF, refractory IF, and adaptive-threshold IF.
+\end{itemize}
+
+\subsection{Metrics}
+Table~\ref{tab:metrics} lists the primary metrics.
+\begin{table}[t]
+\centering
+\caption{Evaluation metrics.}
+\label{tab:metrics}
+\begin{tabular}{ll}
+\toprule
+Metric & Definition \\
+\midrule
+Memory utilization & Useful bits / allocated SRAM bits \\
+Weight overhead & Allocated weight bits / nonzero mapped weight bits \\
+Access count & SRAM reads/writes per natural step \\
+Traffic & Payload and metadata bit-hops \\
+Latency & Encoder + compute + activation + routing cycles \\
+Energy & Access and bit-hop weighted energy estimate \\
+Programmability cost & Extra cycles/state for non-IF neurons \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Hypotheses}
+We expect \arch{} to improve memory utilization when logical group sizes do not align with fixed crossbar blocks, when state requirements differ across neuron models, or when many groups share program code and constants. We expect grouped tiles to reduce communication energy for moderate-to-high within-group activity or multicast fanout, while AER may remain better for extremely sparse groups with large widths. We expect programmable activation to add small latency for basic IF neurons and larger but bounded overhead for stateful neuron models, offset by avoiding separate fixed-function units.
+
+\section{Threats to Validity}
+The simulator is not yet a cycle-accurate RTL model. Analytical energy depends on assumed SRAM and router costs. The baseline is generic and must be parameterized carefully to avoid strawman comparisons. Workload mapping quality can dominate memory utilization. Recurrent ACK behavior must be evaluated on realistic cyclic graphs to ensure local ordering does not hide fabric congestion.
+
+\section{Conclusion}
+This paper draft introduced \arch{}, a hardware-oriented simulator for a grouped-memory neuromorphic accelerator, and defined an analytical framework for comparing it with a vanilla neuromorphic baseline. The central claim is that group-aware LUT mapping, unified memory, bitmap communication, sparse row processing, and programmable spike-only activation can improve memory utilization and expose useful tradeoffs before committing the design to RTL. The next step is to populate the framework with benchmark measurements and calibrated energy models.
+
+\section*{Acknowledgment}
+\todo{Add funding, collaborators, and tool acknowledgments.}
+
+\begin{thebibliography}{9}
+\bibitem{davies2018loihi}
+M. Davies et al., ``Loihi: A Neuromorphic Manycore Processor with On-Chip Learning,'' \emph{IEEE Micro}, 2018.
+
+\bibitem{merolla2014truenorth}
+P. A. Merolla et al., ``A million spiking-neuron integrated circuit with a scalable communication network and interface,'' \emph{Science}, 2014.
+
+\bibitem{furber2014spinnaker}
+S. B. Furber et al., ``The SpiNNaker Project,'' \emph{Proceedings of the IEEE}, 2014.
+
+\bibitem{akopyan2015truenorth}
+F. Akopyan et al., ``TrueNorth: Design and Tool Flow of a 65 mW 1 Million Neuron Programmable Neurosynaptic Chip,'' \emph{IEEE TCAD}, 2015.
+\end{thebibliography}
+
+\end{document}

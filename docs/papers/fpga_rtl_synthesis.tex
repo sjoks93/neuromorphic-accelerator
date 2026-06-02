@@ -1,0 +1,252 @@
+\documentclass[10pt,conference]{IEEEtran}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\newcommand{\arch}{GEM-NMC}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+
+\title{RTL Synthesis of a Group-Event Memory Neuromorphic Core and FPGA Demonstration of Spiking Neural Network Applications}
+
+\author{%
+\IEEEauthorblockN{Author Name(s)}
+\IEEEauthorblockA{Affiliation\\
+Email}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This paper presents an RTL implementation plan for \arch{}, a tiled group-event memory neuromorphic architecture, and demonstrates its use on FPGA for spiking neural network (SNN) applications. The architecture uses compact SRAM lookup tables for group-to-group mapping, bit-packed spike tiles, sparse event extraction, input-bank-major weight storage, packed accumulator memory, ACK-based flow control, a mesh router, and a programmable spike-only activation vector ALU. Starting from a hardware-oriented C simulator, we define synthesizable microarchitectural blocks, interfaces, memory maps, timing constraints, and verification strategy. The target demonstration maps small SNN workloads onto one or more FPGA-resident cores and reports resource utilization, maximum frequency, latency, throughput, power, and application accuracy. This draft gives the paper structure, RTL design choices, and experimental methodology; final numeric results will be inserted after synthesis, place-and-route, and board-level execution.
+\end{abstract}
+
+\begin{IEEEkeywords}
+neuromorphic accelerator, RTL design, FPGA, spiking neural networks, sparse event processing, vector activation, mesh router
+\end{IEEEkeywords}
+
+\section{Introduction}
+Neuromorphic accelerators promise efficient execution of event-driven spiking neural networks by exploiting sparse activity, local state, and asynchronous-looking communication. However, architectural ideas validated in software simulation must eventually be translated into synthesizable RTL with finite SRAM ports, timing constraints, arbitration, queue sizing, and fabric back-pressure. This paper describes the RTL realization of \arch{}, a group-event memory neuromorphic core derived from an existing C simulator.
+
+The architecture targets flexible SNN mapping rather than a single fixed crossbar shape. It maps logical populations through compact SRAM LUTs, communicates spikes as grouped bitmaps, converts bitmaps into sparse events at the destination, stores weights and neuron state in a unified memory, and executes output activation through a bounded programmable vector ALU. The goal of this paper is to show that these mechanisms can be synthesized into FPGA logic and used to run practical SNN examples.
+
+\section{Contributions}
+This draft paper targets the following contributions:
+\begin{enumerate}
+    \item A synthesizable RTL microarchitecture for a group-event memory neuromorphic core.
+    \item A memory and packet interface compatible with the existing simulator mapping model.
+    \item A verification flow that compares RTL traces against the C simulator.
+    \item FPGA implementation results for single-core and multi-core configurations.
+    \item End-to-end demonstrations of SNN inference workloads.
+\end{enumerate}
+
+\section{Background and Design Goals}
+The simulator models a core with explicit SRAM-like arrays, sparse event counters, activation instruction memory, output queues, ACK queues, and a coordinate-addressed router. The RTL design preserves these abstractions but must resolve hardware details that the simulator can model abstractly:
+\begin{itemize}
+    \item finite memory port counts and banking conflicts;
+    \item priority encoder and sparse event extraction timing;
+    \item adder-tree depth and accumulator read-modify-write hazards;
+    \item activation v-ALU instruction fetch, vector lanes, and state SRAM access;
+    \item output and ACK queue back-pressure;
+    \item host configuration, reset, debug, and benchmark control.
+\end{itemize}
+The design goal is not maximum FPGA-specific hand tuning in the first version. Instead, the first RTL should be structurally close to the simulator so that functional equivalence and architectural measurements are straightforward.
+
+\section{RTL Architecture}
+\subsection{Tile-Level Organization}
+Each FPGA tile contains one neuromorphic core, one router endpoint, and optional configuration/debug adapters. A multi-tile design connects routers in a 2D mesh. A single-tile design can bypass physical mesh links and still exercise local input, compute, activation, output, and ACK behavior.
+
+\subsection{Core Pipeline}
+The core pipeline has five main stages:
+\begin{enumerate}
+    \item \textbf{Input accept:} receive a local input tile containing group index, width, and bitmap payload.
+    \item \textbf{LUT expansion:} read the input-group start and terminal start, then iterate over input/output pair entries.
+    \item \textbf{Sparse encoding:} scan the bitmap with multiple encoder lanes and emit active input-event indices.
+    \item \textbf{Weight accumulation:} read input-bank-major weight rows, reduce parallel event contributions, and update packed accumulators.
+    \item \textbf{Activation and egress:} run the output group's v-ALU program, pack spike bits, enqueue successor spike tiles, and enqueue predecessor ACKs.
+\end{enumerate}
+
+\subsection{Mapping Tables}
+All mapping structures are implemented as synthesizable memories. Table~\ref{tab:tables} summarizes the main arrays.
+
+\begin{table}[t]
+\centering
+\caption{RTL mapping memories.}
+\label{tab:tables}
+\begin{tabular}{lll}
+\toprule
+Memory & Read phase & Contents \\
+\midrule
+Input group table & Input accept & valid, width, pair start \\
+Input/output pair LUT & LUT expansion & output group, weight offset \\
+ACK group table & ACK accept & ACK pair start \\
+ACK/output pair LUT & ACK expansion & output group credit target \\
+Output group table & Accum/activation & width, counters, program, route starts \\
+Route LUT & Egress & mesh destination, group index \\
+Accumulator LUT & Accum/activation & unified-SRAM base address \\
+Activation program memory & Activation & micro-ISA instructions \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The start-plus-terminal addressing pattern is preserved because it maps naturally onto one or two SRAM reads and a simple range counter.
+
+\subsection{Unified Memory}
+Unified memory stores three classes of data in one address space: weights, packed accumulators, and optional activation state/parameters. On FPGA, this memory maps to block RAM or UltraRAM depending on target device size. The first implementation will use statically banked true dual-port RAMs. A read-modify-write accumulator update requires either a two-cycle sequence or bypass registers to avoid same-address hazards.
+
+For an event index $i$, output channel $j$, output width $M$, and weight base $a_0$, the weight address is
+\begin{equation}
+    a_w(i,j)=a_0+iM+j.
+\end{equation}
+For packed accumulators, channel $j$ starts at
+\begin{equation}
+    a_a(j)=a_{acc}+jP,
+\end{equation}
+where $P$ is the number of 16-bit lanes per accumulator.
+
+\subsection{Bitmap Encoder}
+The encoder divides an input bitmap across $P_{in}$ lanes. Each lane scans windows of $W_{enc}$ bits with a priority encoder and emits at most one active event per cycle. Empty windows are skipped by advancing the base index. The RTL will expose counters for events, skipped windows, and encoder cycles so it can be correlated with the simulator.
+
+\subsection{Weight and Accumulator Datapath}
+The compute datapath reads output-wide rows from unified memory. Parallel event lanes feed a reduction tree whose outputs are added into accumulator lanes. The first FPGA version will parameterize:
+\begin{itemize}
+    \item input event lanes $P_{in}$;
+    \item output lanes $P_{out}$;
+    \item accumulator lane width and packing factor $P$;
+    \item weight width and accumulator width;
+    \item reduction tree pipeline depth.
+\end{itemize}
+If one output-wide row is wider than the physical memory bandwidth, the controller processes the row in output-channel blocks.
+
+\subsection{Programmable Activation v-ALU}
+The activation unit executes a bounded microprogram per output group. The minimum instruction set includes accumulator load/store, unified-SRAM word load/store, immediate load, integer add/subtract/multiply, compare, predicate emission, and end. A default integrate-and-fire program is implemented as:
+\begin{enumerate}
+    \item load membrane accumulator;
+    \item load threshold immediate;
+    \item compare membrane greater than or equal to threshold;
+    \item emit predicate bits into the output bitmap;
+    \item load reset value;
+    \item store updated accumulator;
+    \item end.
+\end{enumerate}
+The RTL prevents unbounded execution with a maximum instruction count and validated SRAM ranges. Program faults raise status bits and suppress invalid output emission.
+
+\subsection{Router and ACK Network}
+The router uses coordinate-addressed messages. A nonzero width indicates a spike tile; width zero indicates an ACK message. For multicast, destinations are partitioned by next-hop port. Deterministic XY or YX routing is selected at configuration time. ACK messages decode into local ACK groups, which update output-group successor credit through an ACK LUT. Queue full conditions propagate back-pressure to the core.
+
+\section{Host Interface and Tool Flow}
+\subsection{Configuration Path}
+The host loads mapping tables, unified memory contents, activation programs, and route tables before starting a run. Two options are planned:
+\begin{itemize}
+    \item memory-mapped AXI-Lite control and AXI burst loading for FPGA SoC boards;
+    \item UART or PCIe-based loading for standalone boards.
+\end{itemize}
+The same high-level mapper used by the simulator should emit a binary image for RTL memories. This reduces the risk that simulator and RTL evaluate different mappings.
+
+\subsection{RTL Implementation Language}
+The first implementation can be written in SystemVerilog with parameterized modules for memories, encoders, reduction trees, v-ALU lanes, and router queues. A later version may use Chisel, SpinalHDL, or another generator if parameter sweeps become difficult in hand-written RTL.
+
+\subsection{Build Flow}
+The draft assumes the following flow:
+\begin{enumerate}
+    \item Generate mapping and input traces from the C simulator or a Python preprocessing script.
+    \item Run RTL simulation with Verilator or a commercial simulator.
+    \item Compare output spike tiles, ACKs, counters, and memory dumps against the C simulator.
+    \item Synthesize and place-and-route on the target FPGA.
+    \item Run board-level SNN inference and collect timing/power counters.
+\end{enumerate}
+
+\section{Verification Methodology}
+\subsection{Golden-Model Equivalence}
+The C simulator is the golden architectural model. For each test, the verification harness records:
+\begin{itemize}
+    \item input tiles and ACK messages;
+    \item generated output tiles;
+    \item generated predecessor ACKs;
+    \item output-group counters;
+    \item selected unified-memory ranges;
+    \item encoder, compute, activation, and routing counters.
+\end{itemize}
+The RTL trace must match the architectural outputs. Cycle counts may differ if the RTL contains extra pipeline stages, but total event counts and final state must match.
+
+\subsection{Unit Tests}
+Unit tests cover bitmap encoding, LUT range generation, output-wide weight addressing, accumulator packing, IF activation, heterogeneous-threshold activation, ACK credit updates, multicast route splitting, queue full behavior, and recurrent input priming.
+
+\subsection{Formal and Assertion-Based Checks}
+Important assertions include no out-of-range SRAM access, no route LUT overrun, one output bitmap per completed activation program, no ACK counter overflow, no output emission without successor credit, and bounded activation program execution.
+
+\section{SNN Application Demonstrations}
+\subsection{Application 1: Rate-Coded Digit Classification}
+The first demonstration maps a small fully connected or convolutional SNN for MNIST-like digit classification. Static images are converted to rate-coded input spike groups. The FPGA reports classification accuracy, average latency per sample, output spike count, and energy proxy counters.
+
+\subsection{Application 2: Event-Based Gesture or Vision Stream}
+The second demonstration uses event-camera-style input. Events are binned into grouped bitmap tiles and streamed to the FPGA. This workload stresses sparse input extraction, routing, and temporal state.
+
+\subsection{Application 3: Recurrent Reservoir or Temporal Classifier}
+The third demonstration maps recurrent connections to evaluate ACK-cycle handling and recurrent zero-state priming. Metrics include stable progression through natural steps, recurrent traffic, and latency under feedback.
+
+\subsection{Application 4: Neuron-Model Programmability}
+A final microbenchmark compares IF, LIF, refractory IF, and adaptive-threshold IF on the same datapath. The goal is to quantify additional v-ALU cycles, state memory, and resource overhead for programmability.
+
+\section{Evaluation Metrics}
+Table~\ref{tab:eval} lists the planned FPGA metrics.
+
+\begin{table}[t]
+\centering
+\caption{FPGA evaluation metrics.}
+\label{tab:eval}
+\begin{tabular}{ll}
+\toprule
+Metric & Description \\
+\midrule
+LUT/FF/BRAM/DSP & Post-synthesis and post-route utilization \\
+$F_{max}$ & Maximum routed clock frequency \\
+Latency & Cycles and wall time per sample/natural step \\
+Throughput & Samples/s, spikes/s, or tile/s \\
+Power & Board or tool-estimated dynamic/static power \\
+Energy & Power multiplied by measured runtime \\
+Accuracy & Task accuracy versus software reference \\
+Equivalence & RTL outputs matching simulator outputs \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Expected Results and Discussion}
+The expected qualitative outcomes are:
+\begin{itemize}
+    \item Mapping LUTs should consume modest BRAM compared with weight and accumulator storage.
+    \item Unified memory should improve FPGA BRAM packing when neuron models require different state sizes.
+    \item Bitmap communication should reduce router metadata pressure for groups with moderate activity.
+    \item The v-ALU should add predictable latency proportional to program length and output width.
+    \item Multi-core routing should expose queue sizing and ACK latency tradeoffs not visible in single-core tests.
+\end{itemize}
+The final paper will include tables with concrete synthesis numbers for one or more FPGA devices and design points.
+
+\section{Risks and Mitigations}
+The main RTL risk is memory bandwidth. If a single unified SRAM cannot provide enough simultaneous reads and writes, the design will require banking by function, by output lane, or by address interleaving. The second risk is timing closure through the encoder and reduction tree; both blocks should be pipelined and parameterized. The third risk is mismatch between simulator scheduling and RTL scheduling; trace-based equivalence tests and explicit counters are intended to catch these differences early.
+
+\section{Conclusion}
+This draft defined an RTL and FPGA paper plan for \arch{}, a group-event memory neuromorphic core. The design translates simulator concepts---group LUTs, sparse bitmap decoding, unified memory, ACK flow control, mesh routing, and programmable spike activation---into synthesizable blocks. The final manuscript will report RTL verification, FPGA resource and timing results, and SNN application demonstrations.
+
+\section*{Acknowledgment}
+\todo{Add FPGA board, tool, funding, and collaborator acknowledgments.}
+
+\begin{thebibliography}{9}
+\bibitem{davies2018loihi}
+M. Davies et al., ``Loihi: A Neuromorphic Manycore Processor with On-Chip Learning,'' \emph{IEEE Micro}, 2018.
+
+\bibitem{merolla2014truenorth}
+P. A. Merolla et al., ``A million spiking-neuron integrated circuit with a scalable communication network and interface,'' \emph{Science}, 2014.
+
+\bibitem{furber2014spinnaker}
+S. B. Furber et al., ``The SpiNNaker Project,'' \emph{Proceedings of the IEEE}, 2014.
+
+\bibitem{verilator}
+W. Snyder, ``Verilator and SystemVerilog,'' \emph{Veripool}, 2024.
+\end{thebibliography}
+
+\end{document}
