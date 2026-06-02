@@ -18,6 +18,12 @@ typedef enum {
     NMC_MEMORY_OUTPUT_TO_ACCUMULATOR_MUX,
 } NmcMemoryOutputRoute;
 
+#define NMC_ACTIVATION_PROGRAM_IF_IMMEDIATE 0u
+#define NMC_ACTIVATION_PROGRAM_IF_SRAM_THRESHOLD 1u
+#define NMC_ACTIVATION_THRESHOLD_IMMEDIATE 0u
+#define NMC_ACTIVATION_RESET_IMMEDIATE 1u
+#define NMC_ACTIVATION_THRESHOLD_RANGE 0u
+
 bool nmc_core_valid_input_index(const NmcCore *core, nmc_input_index_t input_index);
 bool nmc_core_valid_ack_index(const NmcCore *core, nmc_ack_index_t ack_index);
 bool nmc_core_valid_output_index(const NmcCore *core, nmc_output_index_t output_index);
@@ -44,6 +50,12 @@ bool nmc_core_memory_write_accumulator(NmcCore *core,
                                        size_t accumulator_start,
                                        size_t output_index,
                                        int32_t value);
+bool nmc_core_memory_read_activation_word(const NmcCore *core,
+                                          size_t lane_address,
+                                          int32_t *value);
+bool nmc_core_memory_write_activation_word(NmcCore *core,
+                                           size_t lane_address,
+                                           int32_t value);
 
 bool nmc_core_encode_input_events(const uint8_t *input_payload,
                                   nmc_tile_width_t input_width,
@@ -62,6 +74,10 @@ bool nmc_core_accumulate_pair(NmcCore *core,
 
 bool nmc_core_output_group_ready(const NmcOutputGroup *group);
 size_t nmc_core_output_group_successor_count(const NmcOutputGroup *group);
+bool nmc_core_execute_activation_program(NmcCore *core,
+                                         nmc_output_index_t output_index,
+                                         size_t accumulator_start,
+                                         uint8_t *payload);
 bool nmc_core_activate_output_group(NmcCore *core, nmc_output_index_t output_index);
 
 #endif

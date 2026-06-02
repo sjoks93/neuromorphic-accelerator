@@ -389,6 +389,48 @@ static bool output_accumulator_start(const NmcOutputGroupMappingSpec *spec,
     return true;
 }
 
+static bool output_threshold_immediate(const NmcOutputGroupMappingSpec *spec, int32_t *threshold)
+{
+    *threshold = spec->thresholds != NULL ? spec->thresholds[0] : 1;
+    for (nmc_tile_width_t i = 1u; spec->thresholds != NULL && i < spec->width; ++i) {
+        if (spec->thresholds[i] != *threshold) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool configure_output_activation(NmcCore *core,
+                                        const NmcOutputGroupMappingSpec *spec,
+                                        nmc_output_index_t output_index,
+                                        size_t *next_memory_start)
+{
+    int32_t threshold = 1;
+    if (output_threshold_immediate(spec, &threshold)) {
+        return nmc_core_bind_output_activation_program(core, output_index, NMC_ACTIVATION_PROGRAM_IF_IMMEDIATE) &&
+            nmc_core_set_activation_immediate(core, output_index, NMC_ACTIVATION_THRESHOLD_IMMEDIATE, threshold);
+    }
+
+    if (*next_memory_start > NMC_UNIFIED_MEMORY_SIZE || (size_t)spec->width > NMC_UNIFIED_MEMORY_SIZE - *next_memory_start) {
+        return false;
+    }
+
+    const size_t threshold_start = *next_memory_start;
+    for (nmc_tile_width_t i = 0u; i < spec->width; ++i) {
+        if (!nmc_core_memory_write_activation_word(core, threshold_start + i, spec->thresholds[i])) {
+            return false;
+        }
+    }
+    *next_memory_start += spec->width;
+
+    return nmc_core_bind_activation_sram_range(core,
+                                               output_index,
+                                               NMC_ACTIVATION_THRESHOLD_RANGE,
+                                               threshold_start,
+                                               spec->width) &&
+        nmc_core_bind_output_activation_program(core, output_index, NMC_ACTIVATION_PROGRAM_IF_SRAM_THRESHOLD);
+}
+
 static bool valid_mapping_shape(const NmcCoreMappingSpec *mapping)
 {
     if (!valid_spec_array(mapping->input_groups, mapping->input_group_count) ||
@@ -454,8 +496,9 @@ static bool configure_output_groups(NmcCore *core, const NmcCoreMappingSpec *map
         const NmcOutputGroupMappingSpec *spec = &mapping->output_groups[output_index];
         size_t accumulator_start = 0u;
         if (!output_accumulator_start(spec, next_memory_start, &accumulator_start) ||
-            !nmc_core_add_output_group(core, spec->width, spec->thresholds) ||
-            !nmc_core_set_output_accumulator_lut_start(core, (nmc_output_index_t)output_index, accumulator_start)) {
+            !nmc_core_add_output_group(core, spec->width, NULL) ||
+            !nmc_core_set_output_accumulator_lut_start(core, (nmc_output_index_t)output_index, accumulator_start) ||
+            !configure_output_activation(core, spec, (nmc_output_index_t)output_index, next_memory_start)) {
             return false;
         }
     }

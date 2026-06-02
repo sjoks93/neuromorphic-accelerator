@@ -37,6 +37,15 @@
 #define NMC_ACCUMULATOR_BITS 32u
 #define NMC_ACCUMULATOR_LANES ((NMC_ACCUMULATOR_BITS + NMC_WEIGHT_LANE_BITS - 1u) / NMC_WEIGHT_LANE_BITS)
 #define NMC_UNIFIED_MEMORY_SIZE (NMC_WEIGHT_MEMORY_SIZE + (NMC_ACCUMULATOR_MEMORY_SIZE * NMC_ACCUMULATOR_LANES))
+#define NMC_MAX_ACTIVATION_PROGRAMS 8u
+#define NMC_MAX_ACTIVATION_INSTRUCTIONS 128u
+#define NMC_MAX_ACTIVATION_REGISTERS 8u
+#define NMC_MAX_ACTIVATION_SRAM_RANGES 4u
+#define NMC_MAX_ACTIVATION_IMMEDIATES 8u
+#define NMC_MAX_ACTIVATION_STEPS 256u
+#define NMC_ACTIVATION_MUL_LATENCY 2u
+#define NMC_ACTIVATION_SRAM_LANES NMC_INPUT_PARALLELISM
+#define NMC_ACTIVATION_MEMBRANE_WORDS NMC_ACCUMULATOR_LANES
 #define NMC_INVALID_INDEX UINT32_MAX
 #define NMC_AUTO_WEIGHT_OFFSET SIZE_MAX
 #define NMC_AUTO_ACCUMULATOR_OFFSET SIZE_MAX
@@ -81,10 +90,44 @@ typedef struct {
     size_t predecessor_start;
 } NmcOutputRouteAddress;
 
-/* Per-output-neuron threshold state kept separate from group routing metadata. */
+/* Small spike-only activation v-ALU instruction set. */
+typedef enum {
+    NMC_ACT_OP_END,
+    NMC_ACT_OP_LD_ACC,
+    NMC_ACT_OP_ST_ACC,
+    NMC_ACT_OP_LD_WORD,
+    NMC_ACT_OP_ST_WORD,
+    NMC_ACT_OP_LD_IMM,
+    NMC_ACT_OP_ADD,
+    NMC_ACT_OP_SUB,
+    NMC_ACT_OP_MUL,
+    NMC_ACT_OP_MAC,
+    NMC_ACT_OP_CMP_GE,
+    NMC_ACT_OP_EMIT_PRED,
+} NmcActivationOpcode;
+
 typedef struct {
-    int32_t threshold;
-} NmcNeuron;
+    NmcActivationOpcode opcode;
+    uint8_t dst;
+    uint8_t src0;
+    uint8_t src1;
+    uint8_t range;
+    uint8_t immediate;
+    uint8_t shift;
+} NmcActivationInstruction;
+
+typedef struct {
+    bool valid;
+    size_t start;
+    size_t length;
+    uint32_t max_steps;
+} NmcActivationProgramDescriptor;
+
+typedef struct {
+    bool valid;
+    size_t start;
+    size_t count;
+} NmcActivationSramRange;
 
 /* Input group table entry: stage-1 input LUT plus optional configured width. */
 typedef struct {
@@ -105,7 +148,9 @@ typedef struct {
     uint32_t primed_recurrent_input_count;
     bool recurrent_ack_sent;
     bool predecessor_ack_sent;
-    NmcNeuron neurons[NMC_MAX_GROUP_NEURONS];
+    uint32_t activation_program_index;
+    NmcActivationSramRange activation_sram_ranges[NMC_MAX_ACTIVATION_SRAM_RANGES];
+    int32_t activation_immediates[NMC_MAX_ACTIVATION_IMMEDIATES];
     NmcOutputRouteAddress route_lut;
 } NmcOutputGroup;
 
@@ -303,6 +348,12 @@ typedef struct {
     NmcOutputRouteLutEntry output_route_lut[NMC_MAX_OUTPUT_ROUTE_LUT_ENTRIES];
     size_t output_route_lut_count;
 
+    NmcActivationInstruction activation_instructions[NMC_MAX_ACTIVATION_INSTRUCTIONS];
+    size_t activation_instruction_count;
+
+    NmcActivationProgramDescriptor activation_programs[NMC_MAX_ACTIVATION_PROGRAMS];
+    size_t activation_program_count;
+
     int16_t memory[NMC_UNIFIED_MEMORY_SIZE];
 
     NmcNetworkTile output_queue[NMC_MAX_OUTPUT_QUEUE];
@@ -317,6 +368,11 @@ typedef struct {
     uint64_t total_encoder_cycles;
     uint64_t last_input_tile_encoder_cycles;
     uint32_t last_input_tile_event_count;
+    uint64_t total_activation_cycles;
+    uint64_t last_activation_cycles;
+    uint32_t last_activation_instruction_count;
+    uint32_t last_activation_output_width;
+    uint32_t activation_fault_count;
 } NmcCore;
 
 /* Configuration and runtime API. */
@@ -324,6 +380,23 @@ void nmc_core_init(NmcCore *core, nmc_core_id_t core_id);
 bool nmc_core_add_input_group(NmcCore *core);
 bool nmc_core_add_ack_group(NmcCore *core);
 bool nmc_core_add_output_group(NmcCore *core, nmc_tile_width_t width, const int32_t *thresholds);
+bool nmc_core_add_activation_program(NmcCore *core,
+                                     const NmcActivationInstruction *instructions,
+                                     size_t instruction_count,
+                                     uint32_t max_steps,
+                                     uint32_t *program_index);
+bool nmc_core_bind_output_activation_program(NmcCore *core,
+                                             nmc_output_index_t output_index,
+                                             uint32_t program_index);
+bool nmc_core_bind_activation_sram_range(NmcCore *core,
+                                         nmc_output_index_t output_index,
+                                         uint8_t range_index,
+                                         size_t start,
+                                         size_t count);
+bool nmc_core_set_activation_immediate(NmcCore *core,
+                                       nmc_output_index_t output_index,
+                                       uint8_t immediate_index,
+                                       int32_t value);
 bool nmc_core_set_output_accumulator_lut_start(NmcCore *core,
                                                nmc_output_index_t output_index,
                                                size_t accumulator_start);

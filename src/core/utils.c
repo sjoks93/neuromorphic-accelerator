@@ -7,6 +7,8 @@ _Static_assert(CHAR_BIT == 8, "NMC memory packing requires 8-bit bytes");
 _Static_assert(sizeof(int16_t) * CHAR_BIT == NMC_WEIGHT_LANE_BITS, "NMC weight lane width must match int16_t");
 _Static_assert(sizeof(int32_t) * CHAR_BIT == NMC_ACCUMULATOR_BITS, "NMC accumulator width must match int32_t");
 _Static_assert(NMC_INPUT_PARALLELISM >= NMC_ACCUMULATOR_LANES, "input lanes must hold at least one accumulator value");
+_Static_assert((NMC_ACTIVATION_SRAM_LANES % NMC_ACTIVATION_MEMBRANE_WORDS) == 0u,
+               "membrane word count must divide the activation SRAM lane count");
 
 bool nmc_core_valid_input_index(const NmcCore *core, nmc_input_index_t input_index)
 {
@@ -147,6 +149,30 @@ bool nmc_core_memory_write_accumulator(NmcCore *core,
     for (size_t lane = 0u; lane < NMC_ACCUMULATOR_LANES; ++lane) {
         core->memory[lane_address + lane] = (int16_t)((bits >> (lane * NMC_WEIGHT_LANE_BITS)) & UINT16_MAX);
     }
+    return true;
+}
+
+bool nmc_core_memory_read_activation_word(const NmcCore *core,
+                                          size_t lane_address,
+                                          int32_t *value)
+{
+    if (core == NULL || value == NULL || lane_address >= NMC_UNIFIED_MEMORY_SIZE) {
+        return false;
+    }
+
+    *value = core->memory[lane_address];
+    return true;
+}
+
+bool nmc_core_memory_write_activation_word(NmcCore *core,
+                                           size_t lane_address,
+                                           int32_t value)
+{
+    if (core == NULL || lane_address >= NMC_UNIFIED_MEMORY_SIZE || value < INT16_MIN || value > INT16_MAX) {
+        return false;
+    }
+
+    core->memory[lane_address] = (int16_t)value;
     return true;
 }
 

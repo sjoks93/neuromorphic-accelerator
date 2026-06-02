@@ -28,12 +28,108 @@ bool nmc_core_add_output_group(NmcCore *core, nmc_tile_width_t width, const int3
         return false;
     }
 
+    const int32_t threshold = thresholds ? thresholds[0] : 1;
+    for (nmc_tile_width_t i = 1u; thresholds != NULL && i < width; ++i) {
+        if (thresholds[i] != threshold) {
+            return false;
+        }
+    }
+
     NmcOutputGroup *group = &core->output_groups[core->output_group_count++];
     memset(group, 0, sizeof(*group));
     group->route_lut.bitmap_width = width;
-    for (nmc_tile_width_t i = 0; i < width; ++i) {
-        group->neurons[i].threshold = thresholds ? thresholds[i] : 1;
+    group->activation_program_index = NMC_ACTIVATION_PROGRAM_IF_IMMEDIATE;
+    group->activation_immediates[NMC_ACTIVATION_THRESHOLD_IMMEDIATE] = threshold;
+    return true;
+}
+
+bool nmc_core_add_activation_program(NmcCore *core,
+                                     const NmcActivationInstruction *instructions,
+                                     size_t instruction_count,
+                                     uint32_t max_steps,
+                                     uint32_t *program_index)
+{
+    if (core == NULL || instructions == NULL || instruction_count == 0u ||
+        core->activation_program_count >= NMC_MAX_ACTIVATION_PROGRAMS ||
+        instruction_count > NMC_MAX_ACTIVATION_INSTRUCTIONS - core->activation_instruction_count ||
+        max_steps == 0u) {
+        return false;
     }
+
+    bool has_end = false;
+    for (size_t i = 0u; i < instruction_count; ++i) {
+        if (instructions[i].opcode == NMC_ACT_OP_END) {
+            has_end = true;
+            break;
+        }
+    }
+    if (!has_end) {
+        return false;
+    }
+
+    const uint32_t index = (uint32_t)core->activation_program_count;
+    const size_t start = core->activation_instruction_count;
+    memcpy(&core->activation_instructions[start], instructions, instruction_count * sizeof(instructions[0]));
+    core->activation_programs[core->activation_program_count++] = (NmcActivationProgramDescriptor){
+        .valid = true,
+        .start = start,
+        .length = instruction_count,
+        .max_steps = max_steps,
+    };
+    core->activation_instruction_count += instruction_count;
+
+    if (program_index != NULL) {
+        *program_index = index;
+    }
+    return true;
+}
+
+bool nmc_core_bind_output_activation_program(NmcCore *core,
+                                             nmc_output_index_t output_index,
+                                             uint32_t program_index)
+{
+    if (!nmc_core_valid_output_index(core, output_index) ||
+        program_index >= core->activation_program_count ||
+        !core->activation_programs[program_index].valid) {
+        return false;
+    }
+
+    core->output_groups[output_index].activation_program_index = program_index;
+    return true;
+}
+
+bool nmc_core_bind_activation_sram_range(NmcCore *core,
+                                         nmc_output_index_t output_index,
+                                         uint8_t range_index,
+                                         size_t start,
+                                         size_t count)
+{
+    if (!nmc_core_valid_output_index(core, output_index) ||
+        range_index >= NMC_MAX_ACTIVATION_SRAM_RANGES ||
+        count == 0u ||
+        start > NMC_UNIFIED_MEMORY_SIZE ||
+        count > NMC_UNIFIED_MEMORY_SIZE - start) {
+        return false;
+    }
+
+    core->output_groups[output_index].activation_sram_ranges[range_index] = (NmcActivationSramRange){
+        .valid = true,
+        .start = start,
+        .count = count,
+    };
+    return true;
+}
+
+bool nmc_core_set_activation_immediate(NmcCore *core,
+                                       nmc_output_index_t output_index,
+                                       uint8_t immediate_index,
+                                       int32_t value)
+{
+    if (!nmc_core_valid_output_index(core, output_index) || immediate_index >= NMC_MAX_ACTIVATION_IMMEDIATES) {
+        return false;
+    }
+
+    core->output_groups[output_index].activation_immediates[immediate_index] = value;
     return true;
 }
 
@@ -41,7 +137,9 @@ bool nmc_core_set_output_accumulator_lut_start(NmcCore *core,
                                                nmc_output_index_t output_index,
                                                size_t accumulator_start)
 {
-    if (!nmc_core_valid_output_index(core, output_index) || accumulator_start >= NMC_UNIFIED_MEMORY_SIZE) {
+    if (!nmc_core_valid_output_index(core, output_index) ||
+        accumulator_start >= NMC_UNIFIED_MEMORY_SIZE ||
+        (accumulator_start % NMC_ACTIVATION_SRAM_LANES) != 0u) {
         return false;
     }
 

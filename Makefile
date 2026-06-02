@@ -6,6 +6,7 @@ BUILD_DIR := build
 TARGET := $(BUILD_DIR)/neuromorphic_core_demo
 SRCS := src/main.c \
 	src/core.c \
+	src/core/activation.c \
 	src/core/config.c \
 	src/core/ack.c \
 	src/core/compute.c \
