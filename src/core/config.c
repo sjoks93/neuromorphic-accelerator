@@ -104,11 +104,16 @@ bool nmc_core_bind_activation_sram_range(NmcCore *core,
                                          size_t start,
                                          size_t count)
 {
+    if (count > SIZE_MAX / NMC_ACTIVATION_WORD_LANES) {
+        return false;
+    }
+
+    const size_t lane_span = count * NMC_ACTIVATION_WORD_LANES;
     if (!nmc_core_valid_output_index(core, output_index) ||
         range_index >= NMC_MAX_ACTIVATION_SRAM_RANGES ||
         count == 0u ||
         start > NMC_UNIFIED_MEMORY_SIZE ||
-        count > NMC_UNIFIED_MEMORY_SIZE - start) {
+        lane_span > NMC_UNIFIED_MEMORY_SIZE - start) {
         return false;
     }
 

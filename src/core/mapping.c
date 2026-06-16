@@ -411,7 +411,8 @@ static bool configure_output_activation(NmcCore *core,
             nmc_core_set_activation_immediate(core, output_index, NMC_ACTIVATION_THRESHOLD_IMMEDIATE, threshold);
     }
 
-    if (*next_memory_start > NMC_UNIFIED_MEMORY_SIZE || (size_t)spec->width > NMC_UNIFIED_MEMORY_SIZE - *next_memory_start) {
+    const size_t threshold_lane_span = (size_t)spec->width * NMC_ACTIVATION_WORD_LANES;
+    if (*next_memory_start > NMC_UNIFIED_MEMORY_SIZE || threshold_lane_span > NMC_UNIFIED_MEMORY_SIZE - *next_memory_start) {
         return false;
     }
 
@@ -421,7 +422,7 @@ static bool configure_output_activation(NmcCore *core,
             return false;
         }
     }
-    *next_memory_start += spec->width;
+    *next_memory_start += threshold_lane_span;
 
     return nmc_core_bind_activation_sram_range(core,
                                                output_index,
