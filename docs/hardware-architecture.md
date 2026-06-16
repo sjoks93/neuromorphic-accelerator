@@ -71,10 +71,10 @@ flowchart TB
         Encoder[Bitmap-to-event encoder\nwindow skip + parallel lanes]
         WeightRead[Input-bank row read\noutput-wide weight slice]
         AdderTree[Adder-tree reduction\nper output lane]
-        AccMux[Accumulator lane MUX\npacked 32-bit values]
+        AccMux[Accumulator lane MUX\npacked P-word values]
     end
 
-    subgraph Unified[Unified signed 16-bit SRAM]
+    subgraph Unified[Unified W-bit-word SRAM]
         Weights[Banked weights\ninput-major, output-wide]
         Accums[Packed accumulators\nmembrane potential]
         ActState[Optional activation\nstate / parameter vectors]
@@ -111,7 +111,7 @@ flowchart TB
 
 ## Unified-memory layout
 
-The simulator models one unified signed 16-bit memory space. Weight matrices are transposed from caller-facing output-major form into input-bank-major, output-wide rows. Accumulators use packed lanes, so one logical membrane value occupies `NMC_ACCUMULATOR_LANES` adjacent 16-bit words. Optional per-neuron activation state or parameters are allocated only when a program requires them.
+The simulator models one unified memory space of `W`-bit words (`W = NMC_WEIGHT_LANE_BITS`). Weight matrices are transposed from caller-facing output-major form into input-bank-major, output-wide rows. Accumulators use packed words, so one logical membrane value occupies `P` adjacent words (`P = NMC_ACCUMULATOR_WEIGHT_MULTIPLE`). Optional per-neuron activation state or parameters are allocated only when a program requires them, with word width independently controlled by `NMC_ACTIVATION_WORD_WEIGHT_MULTIPLE`.
 
 ```mermaid
 flowchart LR

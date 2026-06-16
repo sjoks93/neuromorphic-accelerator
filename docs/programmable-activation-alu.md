@@ -1,4 +1,4 @@
-# Proposal: Programmable Neuron Activation ALU
+# Programmable Neuron Activation ALU
 
 ## Summary
 
@@ -71,7 +71,7 @@ The activation engine is a small vector processor specialized for output groups:
 4. **SRAM-to-v-ALU load MUX**
    - The v-ALU reads activation operands through a MUX between unified SRAM and the v-ALU input registers.
    - The MUX can select either one SRAM word, equivalent to one weight-lane datatype, or one packed membrane word made of `P` SRAM words.
-   - `P` is the number of weight-lane words needed to represent one membrane/accumulator value, e.g. `P = NMC_ACCUMULATOR_LANES`.
+   - `P` is the number of weight-word slices needed to represent one membrane/accumulator value, where `P = NMC_ACCUMULATOR_WEIGHT_MULTIPLE`.
    - `P` must be a factor of the physical SRAM lane count `N`, where `N` is the number of lanes in a memory row or v-ALU access group.
    - Packed membrane values are aligned and non-fragmented: the first accumulator starts at lane 0, and each following accumulator starts at a multiple of `P`.
    - This keeps accumulator loads deterministic: a membrane load is a fixed aligned `P`-word slice rather than a scattered gather.
@@ -235,7 +235,8 @@ Add fixed hardware limits:
 - `NMC_MAX_ACTIVATION_STEPS`
 - `NMC_ACTIVATION_MUL_LATENCY`
 - `NMC_ACTIVATION_SRAM_LANES`
-- `NMC_ACTIVATION_MEMBRANE_WORDS`
+- `NMC_ACCUMULATOR_WEIGHT_MULTIPLE`
+- `NMC_ACTIVATION_WORD_WEIGHT_MULTIPLE`
 
 Add types:
 
@@ -250,7 +251,7 @@ Extend each output group with:
 - `activation_program_index`
 - optional validated unified-SRAM state/parameter ranges
 - optional per-group immediate operands
-- accumulator/membrane packing metadata, where each membrane uses `P = NMC_ACTIVATION_MEMBRANE_WORDS` SRAM words
+- accumulator/membrane packing metadata, where each membrane uses `P = NMC_ACCUMULATOR_WEIGHT_MULTIPLE` weight-width words
 - activation status/counters for instrumentation
 
 The existing `NmcNeuron.threshold` field should become a compatibility path for mappings that already provide threshold arrays. The target hardware model should treat threshold as an immediate by default: one constant per output group, or one core-wide default threshold shared by groups that do not override it. Per-neuron threshold vectors should be stored in unified SRAM only when heterogeneous thresholds are explicitly requested.

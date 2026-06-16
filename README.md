@@ -6,11 +6,11 @@ This is a functional architecture simulator with behavioral micro-architectural 
 
 The goal is not to build a production neural-network runtime yet. The goal is to keep a C model close enough to the intended hardware that memory layout, mapping pressure, synchronization, communication overhead, accumulator reuse, and activation flexibility can be studied before moving the design into synthesizable RTL.
 
-## Why this architecture
+## Key ideas
 
 The simulator explores an accelerator organization built around groups of neurons rather than fixed crossbar blocks. Logical groups are mapped into compact SRAM-backed structures, communicated as bitmaps, reduced through sparse event processing, and activated by a small vector ALU.
 
-Key ideas:
+The Key ideas of this architecture are summarized as follows:
 
 - **Group-to-group mapping**: Neurons are mapped in groups, and each group is placed on a core. Neurons in a group share the same input and output groups, so they can consume common input and emit one shared spike-bitmap message. A core can host multiple groups. Compact LUTs encode source/destination mappings and hold memory pointers, giving a compact representation compared with per-neuron mapping. This supports flexible fan-in/fan-out dimensions, multiple co-resident groups, and weight sharing without memory fragmentation.
 - **Unified memory structure**: Weights, accumulators, and optional per-neuron states/parameters share one memory space. This avoids fixed-partition waste and supports different weight-to-neuron ratios. Group-wise LUTs carry the memory pointers needed by each group-to-group mapping and each output neuron group.
@@ -164,6 +164,18 @@ An `NmcCore` models one accelerator core with fixed-capacity SRAM-like arrays an
 The core uses start-plus-terminal LUT layouts throughout. A group range is derived from entry `i` and entry `i + 1`, mirroring simple hardware address generation and avoiding per-entry dynamic allocation.
 
 Natural-step progression is enforced with readiness and ACK counters: output activation requires complete input coverage (`input_count == input_requirement`) and successor credit (`ack_count` versus successor fanout) before emission.
+
+## Router model
+
+The simulator includes a standalone 2D mesh router model (`NmcRouter`) that is intentionally separate from `NmcCore`.
+
+- Messages are coordinate-addressed and carry either a spike tile (`width > 0`) or an ACK (`width == 0`).
+- Routing order is configurable as XY or YX dimension-order routing.
+- Multicast is modeled as one payload plus a destination list, then split by next-hop port (`LOCAL`, `EAST`, `WEST`, `NORTH`, `SOUTH`).
+- Local deliveries can be decoded into destination-core-local input tiles or ACK messages.
+- ACKs traverse the same routed fabric and return predecessor credit, closing the natural-step synchronization loop.
+
+This router model targets architecture-level communication behavior and flow-control effects; it is not a cycle-accurate RTL arbitration/timing model.
 
 ## Dataflow
 

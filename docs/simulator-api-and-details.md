@@ -92,8 +92,8 @@ An `NmcCore` models one accelerator core with local SRAM-like arrays and fixed m
 - Output group table: bitmap width, activation program binding, activation immediates, optional activation SRAM ranges, input readiness counters, successor ACK counters, and output route starts.
 - Output route LUT: successor destinations for output spike tiles followed by predecessor destinations for multicast ACKs.
 - Accumulator LUT: per-output starting lane addresses into unified memory.
-- Unified memory: signed 16-bit lanes shared by input-bank-major weights, packed accumulator values, and optional activation state or parameters.
-- Accumulator values: signed 32-bit membrane potentials packed across `NMC_ACCUMULATOR_LANES` neighboring weight lanes and selected through an accumulator MUX.
+- Unified memory: `W`-bit words (`W = NMC_WEIGHT_LANE_BITS`) shared by input-bank-major weights, packed accumulator values, and optional activation state or parameters.
+- Accumulator values: signed membrane potentials represented as `P` packed weight-width words (`P = NMC_ACCUMULATOR_WEIGHT_MULTIPLE`) and selected through an accumulator MUX.
 - Activation instruction memory and program descriptors for the spike-only v-ALU.
 - Output and ACK queues used by the surrounding router/fabric model.
 
@@ -154,7 +154,7 @@ Accumulation scheduling:
 
 - For a connected input width `N` and output width `M`, the unified memory weight slice has `N` logical input banks/rows.
 - Each input bank row is `M`-wide: one sparse event selects all `M` weights for that input channel in one memory row.
-- The accumulator slice is `M`-wide logically, but each membrane potential occupies `NMC_ACCUMULATOR_LANES` 16-bit memory lanes. With the default 32-bit accumulator and 16-bit weight lane, one membrane potential uses two lanes.
+- The accumulator slice is `M`-wide logically, but each membrane potential occupies `P` packed words (`P = NMC_ACCUMULATOR_WEIGHT_MULTIPLE`) of width `W` (`W = NMC_WEIGHT_LANE_BITS`).
 - Accumulators are packed into rows of `NMC_INPUT_PARALLELISM` lanes. The controller selects the accumulator MUX index for the requested output channel and reads or writes only the lanes needed for that one accumulator, leaving neighboring packed accumulators in the same row untouched.
 - During one event step, up to `NMC_INPUT_PARALLELISM` weight-bank rows are routed to the adder tree, reduced per output channel, and added to values read through the accumulator MUX.
 - The runtime banked weight address is `weight_offset + event_index * output_width + output_index`.
@@ -485,8 +485,8 @@ Internal API:
 | `nmc_core_memory_read_weight_lane()` | Routes one unified-memory lane to the adder tree for weight accumulation. |
 | `nmc_core_memory_read_accumulator()` | Routes only the selected packed accumulator lanes through the accumulator MUX and reconstructs one membrane potential. |
 | `nmc_core_memory_write_accumulator()` | Writes only the selected packed accumulator lanes back to unified memory. |
-| `nmc_core_memory_read_activation_word()` | Reads one signed 16-bit activation state/parameter lane as a widened 32-bit value. |
-| `nmc_core_memory_write_activation_word()` | Writes one activation state/parameter lane after validating that the value fits in 16 bits. |
+| `nmc_core_memory_read_activation_word()` | Reads one activation state/parameter word assembled from `NMC_ACTIVATION_WORD_LANES` packed weight-width lanes and sign-extends to the `int32_t` API value width. |
+| `nmc_core_memory_write_activation_word()` | Writes one activation state/parameter word by splitting it across `NMC_ACTIVATION_WORD_LANES` packed weight-width lanes after range validation. |
 | `nmc_print_payload()` | Public debug helper for printing payload bitmaps. |
 
 Payload bits are little-endian within each byte for storage and computation. `nmc_print_payload()` reverses the display order so traces read like conventional binary literals.
@@ -573,8 +573,11 @@ The main hardware-style limits are defined in `include/nmc/core.h` and `include/
 | `NMC_MAX_TILE_DESTINATIONS` | Maximum multicast destinations in one tile or ACK message. |
 | `NMC_WEIGHT_MEMORY_SIZE` | Legacy weight-lane capacity contribution to unified memory. |
 | `NMC_ACCUMULATOR_MEMORY_SIZE` | Legacy accumulator-value capacity contribution to unified memory. |
-| `NMC_ACCUMULATOR_LANES` | Number of 16-bit unified-memory lanes occupied by one accumulator value. |
-| `NMC_UNIFIED_MEMORY_SIZE` | Signed 16-bit memory lanes shared by weights, packed accumulators, and optional activation state/parameters. |
+| `NMC_WEIGHT_LANE_BITS` | Bit-width `W` of one unified-memory word. |
+| `NMC_ACCUMULATOR_WEIGHT_MULTIPLE` | Number of weight-width words `P` used per accumulator value; accumulator width is `P * W`. |
+| `NMC_ACTIVATION_WORD_WEIGHT_MULTIPLE` | Number of weight-width words used per activation state/parameter word. |
+| `NMC_ACCUMULATOR_LANES` | Derived packed word count used by accumulator read/write helpers. |
+| `NMC_UNIFIED_MEMORY_SIZE` | Total unified-memory word capacity shared by weights, packed accumulators, and optional activation state/parameters. |
 | `NMC_INPUT_PARALLELISM` | Number of input event lanes in the compute schedule. |
 | `NMC_OUTPUT_PARALLELISM` | Output vector-lane knob used by activation cycle estimates; the current memory model updates each output group with its full output-wide accumulator row. |
 | `NMC_MAX_ACTIVATION_PROGRAMS` | Maximum activation program descriptors per core. |
@@ -585,7 +588,6 @@ The main hardware-style limits are defined in `include/nmc/core.h` and `include/
 | `NMC_MAX_ACTIVATION_STEPS` | Default activation watchdog budget. |
 | `NMC_ACTIVATION_MUL_LATENCY` | Modeled extra latency for activation multiply/MAC instructions. |
 | `NMC_ACTIVATION_SRAM_LANES` | Activation SRAM access lane grouping. |
-| `NMC_ACTIVATION_MEMBRANE_WORDS` | Number of weight-sized words occupied by one membrane/accumulator value. |
 | `NMC_ROUTER_MAX_PORT_QUEUE` | Queue depth per router output port. |
 
 Tile widths must be positive multiples of 8 and no larger than `NMC_MAX_GROUP_NEURONS`.
