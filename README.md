@@ -1,6 +1,8 @@
 # Neuromorphic Accelerator Simulator
 
-This repository contains a dependency-free C11 simulator for a digital neuromorphic accelerator architecture. The simulator models a tiled, event-driven core with hardware-like SRAM tables, sparse bitmap communication, routed multicast traffic, ACK-based flow control, unified memory, and a programmable activation v-ALU.
+This repository contains a dependency-free C11 simulator for a digital neuromorphic accelerator architecture. The simulator models a tiled, event-driven core with hardware-like SRAM tables, sparse bitmap communication, routed multicast traffic, ACK-based synchronization and back-pressure, unified memory, and a programmable activation v-ALU.
+
+This is a functional architecture simulator with behavioral micro-architectural fidelity. It models key hardware mechanisms including LUT-driven mapping, routed multicast and ACK/back-pressure synchronization, parameterized memory organization, and dataflow scheduling (encoder, reduction, and inner-product accumulator reuse). It is intended to capture architecture-level behavior and performance trade-offs rather than full RTL timing accuracy (for now).
 
 The goal is not to build a production neural-network runtime yet. The goal is to keep a C model close enough to the intended hardware that memory layout, mapping pressure, synchronization, communication overhead, accumulator reuse, and activation flexibility can be studied before moving the design into synthesizable RTL.
 
@@ -10,58 +12,70 @@ The simulator explores an accelerator organization built around groups of neuron
 
 Key ideas:
 
-- **Group-to-group mapping**: logical source and destination groups are mapped through compact LUT ranges instead of a static crossbar. This avoids fragmentation, supports many group sizes, allows flexible fan-in/fan-out, and can support weight sharing because multiple group edges may point at the same weight slice.
-- **Unified memory structure**: weights, packed accumulators, and optional activation state/parameters share one memory space, so mappings can handle different weight-to-neuron ratios without hard partition waste.
-- **Grouped bitmaps**: spikes are carried as bit-packed group payloads instead of one-address-per-event AER packets. This reduces communication metadata and gives the destination core a dense representation that can be converted into parallel sparse event streams.
-- **On-the-fly encoder**: incoming bitmaps are translated into sparse input events at the destination core. Empty windows are skipped, so sparse activity avoids unnecessary compute work.
-- **Adder-tree reduction**: sparse events from parallel encoder lanes are consumed concurrently, routed through weight lanes, reduced by output channel, and accumulated into reused accumulator storage.
-- **Parallel output neurons**: output groups are processed in SIMD-like rows, allowing one input event to select an output-wide weight row and update many output neuron accumulators.
-- **Neuron-first schedule**: within a bitmap window, each neuron state's accumulator lanes are reused across the full bitmap/event schedule before moving to the next set of neurons, improving local state reuse.
-- **Programmable v-ALU activation**: the activation stage is a small spike-only vector ALU. It can adapt to different neuron models with different states, parameters, and functions without dedicating dead hardware or fragmenting memory for every possible neuron type.
+- **Group-to-group mapping**: Neurons are mapped in groups, and each group is placed on a core. Neurons in a group share the same input and output groups, so they can consume common input and emit one shared spike-bitmap message. A core can host multiple groups. Compact LUTs encode source/destination mappings and hold memory pointers, giving a compact representation compared with per-neuron mapping. This supports flexible fan-in/fan-out dimensions, multiple co-resident groups, and weight sharing without memory fragmentation.
+- **Unified memory structure**: Weights, accumulators, and optional per-neuron states/parameters share one memory space. This avoids fixed-partition waste and supports different weight-to-neuron ratios. Group-wise LUTs carry the memory pointers needed by each group-to-group mapping and each output neuron group.
+- **Grouped bitmaps**: All neurons in a group are activated together, so outputs are packed into one bitmapped message. Spikes are carried as bit-packed group payloads instead of one-address-per-event AER packets. This reduces communication metadata and gives the destination core a dense format that can be converted into parallel sparse event streams. Bitmap encoding is chosen because metadata size is fixed, it is usually more compact (except at very high sparsity, e.g., >95%), and it enables straightforward parallel on-the-fly encoding for conflict-free parallel consumption of non-zero events.
+- **Route-aware multicast delivery**: A single emitted spike bitmap can target multiple successor groups. The route LUT carries destination lists, and the router splits multicast traffic by next hop so one logical event fan-out does not require duplicating compute at the source core. This preserves communication efficiency for high fan-out graphs while keeping destination-local decode simple.
+- **On-the-fly encoder**: Incoming bitmaps are interleaved across parallel lanes, and each lane translates its partial bitmap into sparse input events. Empty windows are skipped, so sparse activity avoids unnecessary compute work.
+- **Adder-tree reduction**: Sparse events from parallel encoder lanes are consumed concurrently. Because incoming bitmaps are interleaved deterministically, each lane has deterministic input channel indices. That determinism enables proper banking and parallel weight access without conflicts.
+- **Parallel output neurons**: Output groups are processed in SIMD-like rows, allowing one input event to select an output-wide weight row and update many output neuron accumulators.
+- **Inner-product schedule**: Within a bitmap window, each neuron state's accumulator (membrane potential) are reused across the full bitmap/event schedule before moving to the next set of neurons, improving local state reuse.
+- **Programmable v-ALU activation**: The activation stage is a small spike-only vector ALU. It can adapt to different neuron models with different states, parameters, and functions without dedicating dead hardware or fragmenting memory for every possible neuron type.
+- **ACK-based synchronization and back-pressure**: Each neuron group tracks the number of input groups consumed. When the count reaches the required input groups, the group fires (sending its spike bitmap forward) and sends ACKs back to its predecessors. Firing only proceeds when all ACKs from successor recipients have been received, ensuring proper scheduling and flow control between globally asynchronous cores without global clocks or explicit timestamps.
 
 ## Implemented features
 
+### Accelerator hyper-parameters
+
+- **Datapath parallelism**: `NMC_INPUT_PARALLELISM` and `NMC_OUTPUT_PARALLELISM` set encoder/compute lane parallelism and output-lane width.
+- **Event extraction granularity**: `NMC_EVENT_ENCODER_WINDOW` sets sparse encoder window size.
+- **Structural capacities**: `NMC_MAX_INPUT_GROUPS`, `NMC_MAX_ACK_GROUPS`, `NMC_MAX_OUTPUT_GROUPS`, LUT capacities, and `NMC_MAX_TILE_DESTINATIONS` bound table sizes and multicast fanout.
+- **Buffering resources**: `NMC_MAX_OUTPUT_QUEUE`, `NMC_MAX_ACK_QUEUE`, and `NMC_ROUTER_MAX_PORT_QUEUE` size core/router buffering.
+- **Memory architecture**: the core memory datapath is parameterized as `N` banks by `M`-wide access of `W`-bit words, where `N = NMC_INPUT_PARALLELISM`, `M = NMC_OUTPUT_PARALLELISM`, and `W = NMC_WEIGHT_LANE_BITS`. `NMC_WEIGHT_MEMORY_SIZE` and `NMC_ACCUMULATOR_MEMORY_SIZE` set total weight/accumulator storage. Accumulator width is `P * W` with `P = NMC_ACCUMULATOR_WEIGHT_MULTIPLE`, while activation state/parameter word width is independently set by `NMC_ACTIVATION_WORD_WEIGHT_MULTIPLE`.
+- **Activation v-ALU resources**: `NMC_MAX_ACTIVATION_PROGRAMS`, `NMC_MAX_ACTIVATION_INSTRUCTIONS`, `NMC_MAX_ACTIVATION_REGISTERS`, `NMC_MAX_ACTIVATION_SRAM_RANGES`, `NMC_MAX_ACTIVATION_IMMEDIATES`, `NMC_MAX_ACTIVATION_STEPS`, and `NMC_ACTIVATION_MUL_LATENCY` bound activation programmability and latency.
+
 ### Mapping and memory
 
-- High-level network mapping from logical groups, external inputs, group-to-group edges, and core placement.
-- Automatic lowering into per-core input groups, output groups, input/output pair LUTs, ACK LUTs, route LUTs, predecessor ACK routes, terminal sentinels, accumulator starts, and input requirements.
-- Efficient group-to-group mapping with flexible fan-in and fan-out.
-- Shared route/ACK metadata for multicast outputs and successor synchronization.
-- Input-bank-major, output-wide weight storage in unified memory.
-- Caller-facing weights can remain conventional output-major matrices; the mapper transposes them into the banked memory layout.
-- Packed accumulators stored in the same signed 16-bit unified memory lane space as weights.
-- Optional activation state and per-neuron parameters stored in unified memory only when a model requires them.
+- The mapper accepts neuron groups, external inputs, group-to-group edges, and core placement at a high level.
+- It lowers the network into per-core input/output groups, input/output pair LUTs, ACK LUTs, route LUTs, predecessor ACK routes, terminal sentinels, accumulator starts, and input requirements.
+- Group-to-group mapping supports flexible fan-in and fan-out without fixed crossbar waste.
+- Route and ACK metadata are shared for multicast outputs and successor synchronization.
+- Unified memory uses input-bank-major, output-wide weight storage.
+- User-input weights remain conventional output-major matrices; the mapper transposes them into the banked layout automatically.
+- Packed accumulators (membrane potential) share the same `W`-bit lane space as weights (`W = NMC_WEIGHT_LANE_BITS`), and each accumulator spans `P` words (`P = NMC_ACCUMULATOR_WEIGHT_MULTIPLE`) for width `P * W`.
+- Additional states and per-neuron parameters are stored only when a neuron model requires them.
 
 ### Input and compute path
 
-- Byte-array bitmap input tiles with byte-aligned group widths.
-- Sparse bitmap-to-event encoding split across parallel input lanes.
-- Event encoder windows that skip empty sparse regions.
-- Sparse event-driven weighted accumulation.
-- Input event rows select output-wide weight slices.
-- Accumulator MUX logic reads and writes only the packed accumulator lanes needed by a selected output neuron value.
-- Adder-tree-style reduction of concurrent lane events into output accumulators.
-- Schedule counters for event count, encoder cycles, compute cycles, and accumulated totals.
+- Input tiles are byte-array bitmaps with byte-aligned group widths.
+- Bitmap-to-event encoding runs across parallel input lanes.
+- Encoder windows skip empty sparse regions to avoid unnecessary stalls.
+- Sparse events drive weighted accumulation.
+- Input event rows select output-wide weight slices. For sparse/event-based processing, each row can have a different weight address.
+- Accumulators are packed across `W`-bit words (`W = NMC_WEIGHT_LANE_BITS`). For each output neuron, the accumulator MUX reads and writes the corresponding `P` words (`P = NMC_ACCUMULATOR_WEIGHT_MULTIPLE`) rather than touching unrelated state; this maps to `P` weight-width read/update slices for a full accumulator value.
+- Inner-product schedule: for one input-group bitmap, all non-zero events are consumed while reusing the same destination output-group accumulator slice; the core completes accumulation over the bitmap's sparse events before advancing to the next group's accumulation context.
+- Concurrent lane events are reduced in adder-tree style into output accumulators.
+- Schedule counters track event count, encoder cycles, compute cycles, and accumulated totals.
 
 ### Output, activation, and synchronization
 
-- Output groups track input readiness with `input_count` versus `input_requirement`.
-- Successor flow control tracks ACK credit with `ack_count` versus route successor count.
-- Natural step ordering is modeled without explicit timestep tags.
-- Output activation waits for input completion, successor ACK credit, valid route metadata, and queue capacity.
+- Output groups track readiness using `input_count` versus `input_requirement`.
+- ACK-based back-pressure tracks successor credit using `ack_count` versus successor route count.
+- Natural-step ordering is modeled without explicit timestep tags to support globally asynchronous cores.
+- Output activation requires input completion, successor ACK credit, valid route metadata, and queue capacity.
 - Feed-forward predecessor ACKs are emitted when output activation succeeds.
 - Recurrent predecessor ACKs can be emitted at input-window completion to break ACK cycles while preserving one-tile ordering.
-- Recurrent/cyclic group edges can be auto-detected or explicitly marked, and recurrent inputs are initially primed with an all-zero state.
-- Programmable spike-only activation v-ALU with default integrate-and-fire behavior.
+- Recurrent/cyclic edges can be auto-detected or explicitly marked, and recurrent inputs are initially primed with an all-zero state.
+- Activation uses a programmable spike-only v-ALU with default integrate-and-fire behavior.
 - Uniform thresholds use immediate operands by default; heterogeneous thresholds are stored in unified SRAM only when requested.
 - Output spike payloads are emitted as grouped bitmaps and multicast to successor destinations.
 
 ### Router and mesh model
 
 - Standalone 2D mesh router model.
-- Coordinate-addressed router messages for spike tiles and ACK messages.
+- Coordinate-addressed router messages carry both spike tiles and ACK messages.
 - Configurable XY or YX dimension-order routing.
-- Multicast fanout splitting by next-hop port.
+- Multicast fanout is split by next-hop port.
 - Router-facing network tiles can be decoded into destination-local input tiles.
 - Router-facing ACK messages can be decoded into destination-local ACK messages.
 - The demo includes a small multi-core mesh scenario that exercises routed spike traffic and ACK return.
@@ -144,10 +158,12 @@ An `NmcCore` models one accelerator core with fixed-capacity SRAM-like arrays an
 - Output group table: bitmap width, activation program binding, activation immediates/ranges, readiness counters, synchronization counters, and route metadata.
 - Output route LUT: successor destinations for emitted spike tiles followed by predecessor destinations for ACK return.
 - Accumulator LUT: per-output-group base addresses into unified memory.
-- Unified memory: signed 16-bit lanes shared by banked weights, packed accumulators, and optional activation state/parameters.
+- Unified memory: `W`-bit words (`W = NMC_WEIGHT_LANE_BITS`) organized for `N` input-bank reads and `M`-wide output processing (`N = NMC_INPUT_PARALLELISM`, `M = NMC_OUTPUT_PARALLELISM`), shared by banked weights, accumulators, and optional per-neuron state/parameters.
 - Output and ACK queues: router-facing messages awaiting fabric delivery.
 
 The core uses start-plus-terminal LUT layouts throughout. A group range is derived from entry `i` and entry `i + 1`, mirroring simple hardware address generation and avoiding per-entry dynamic allocation.
+
+Natural-step progression is enforced with readiness and ACK counters: output activation requires complete input coverage (`input_count == input_requirement`) and successor credit (`ack_count` versus successor fanout) before emission.
 
 ## Dataflow
 
@@ -155,7 +171,7 @@ The core uses start-plus-terminal LUT layouts throughout. A group range is deriv
 
 The graph-level mapper accepts logical group descriptions, external input edges, group-to-group connections, weight matrices, recurrent flags, and core placement. It lowers this network into concrete per-core tables.
 
-This mapping approach is compact because memory is allocated per actual group edge rather than per possible source/destination crossbar slot. Different output groups can have different fan-in, fan-out, widths, and weight-to-neuron ratios. When desired, multiple connections can point to the same weight offset to model weight sharing.
+This mapping approach is compact because memory is allocated per actual group edge rather than per possible source/destination crossbar slot. Different output groups can have different fan-in, fan-out, widths, and weight-to-neuron ratios. When desired, multiple connections can point to the same weight offset to model weight sharing. Caller-facing output-major weights are transposed into the input-bank-major, output-wide layout during lowering.
 
 ### 2. Input tile consumption
 
@@ -171,11 +187,13 @@ When a tile arrives:
 6. Reduced values are accumulated into the destination output group's packed accumulator slice.
 7. The destination output group's input readiness counter is advanced.
 
+Within one input-group bitmap, the simulator keeps the destination accumulator context active and reuses it across all sparse events from that bitmap before moving to the next accumulation context.
+
 ### 3. Sparse compute schedule
 
-For an input width `N` and output width `M`, the weight slice is stored as `N` logical input banks, each containing `M` output weights. A sparse input event selects one bank row. The row is consumed across output neurons, reduced through the modeled adder tree, and accumulated into packed accumulator values in unified memory.
+For an input width `N` and output width `M`, the weight slice is stored as `N` logical input banks, each containing an `M`-wide row of `W`-bit weights (`W = NMC_WEIGHT_LANE_BITS`). A sparse input event selects one bank row. The row is consumed across output neurons, reduced through the modeled adder tree, and accumulated into packed accumulator values in unified memory. Accumulators are represented as `P` words per neuron (`P = NMC_ACCUMULATOR_WEIGHT_MULTIPLE`), so accumulator width is `P * W`.
 
-This models the intended hardware schedule: grouped bitmap communication first, sparse event extraction at the destination, then high-reuse output-wide accumulation.
+This models the intended inner-product schedule: grouped bitmap communication first, sparse event extraction at the destination, then high-reuse output-wide accumulation with accumulator reuse across the bitmap's sparse events.
 
 ### 4. Activation
 
@@ -193,9 +211,9 @@ The same instruction model can express variants such as leaky integrate-and-fire
 
 ### 5. Routing and ACK flow
 
-Output spike tiles carry one bitmap payload and a destination list. The router partitions multicast messages by next-hop port and forwards them through the mesh.
+Output spike tiles carry one bitmap payload and a destination list. The router partitions multicast messages by next-hop port and forwards them through the mesh, preserving one-source/many-destination delivery without source-side compute duplication.
 
-ACKs are also routed messages. They return synchronization credit to predecessor output groups through an ACK LUT, allowing one ACK input group to update one or more waiting output groups. This creates a one-in-flight natural-step protocol without global timestep tags.
+ACKs are also routed messages. They return synchronization credit to predecessor output groups through an ACK LUT, allowing one ACK input group to update one or more waiting output groups. This creates a one-in-flight natural-step protocol without global timestep tags and provides back-pressure between globally asynchronous cores.
 
 ## Public API
 
@@ -249,6 +267,9 @@ Hardware-style limits are defined in the public headers. The most important knob
 - `NMC_MAX_TILE_DESTINATIONS`
 - `NMC_UNIFIED_MEMORY_SIZE`
 - `NMC_ACCUMULATOR_LANES`
+- `NMC_WEIGHT_LANE_BITS`
+- `NMC_ACCUMULATOR_WEIGHT_MULTIPLE`
+- `NMC_ACTIVATION_WORD_WEIGHT_MULTIPLE`
 - `NMC_INPUT_PARALLELISM`
 - `NMC_EVENT_ENCODER_WINDOW`
 - `NMC_MAX_ACTIVATION_PROGRAMS`
@@ -285,6 +306,7 @@ Tile widths must be positive, byte-aligned, and no larger than `NMC_MAX_GROUP_NE
 - Explore support for non-stateful neurons such as binary ReLU without wasting accumulator memory.
 - One candidate is time-multiplexing accumulator space across different output lines.
 - This is intentionally delayed because it complicates scheduling, mapping, ACK timing, and accumulator ownership.
+- Explore how to extend this to valued inputs. How can we support both values and spiking inputs/outputs efficiently?
 
 ### Simulator next steps
 
